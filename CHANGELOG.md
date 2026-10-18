@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Reviewers can inspect local committed ranges with `watchdog_diff({ baseRef: "main" })` without shell access or a parent-generated artifact. Refs are pinned, the merge base is explicit, and working-tree changes, external diff/textconv programs, and lazy object fetching are excluded.
+
 ### Changed
 
 - A parent session that never delegates no longer declares `subagent_supervisor`, which saves about 420 characters of tool definition on every request. The tool now becomes active with `subagent`, or when a child request reaches a session that does not have it, for example from a scheduled run. A resumed session keeps it if its transcript declared it, so upgrading does not change an existing session's tools or miss its prompt cache. Thanks to [@armchairfuturist-code](https://github.com/armchairfuturist-code) for reporting [#2936](https://github.com/nicobailon/pi-subagents/issues/2936).

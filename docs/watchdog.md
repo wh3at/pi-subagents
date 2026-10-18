@@ -75,6 +75,21 @@ Child watchdog findings are lifted into the parent in three ways:
 - **`WATCHDOG.md`** standing instructions, read fresh on every review: `<project>/.pi/WATCHDOG.md` first, then `~/.pi/agent/WATCHDOG.md`, capped at 8,000 characters. Set `guidance.watchdogMd: false` to ignore them.
 - **LSP diagnostics** from `typescript-language-server`, auto-detected in `node_modules/.bin` or `PATH`; it is never installed and never run over the whole workspace. Errors become blockers, warnings concerns, and info/hints stay in status.
 
+## Committed-range reviews
+
+The `reviewer` subagent uses the same read-only `watchdog_diff` tool. Its default is the working-tree delta against reviewer-launch HEAD; it does not include earlier commits. For an explicit committed target, supply `baseRef`:
+
+```text
+watchdog_diff({ baseRef: "main" })
+watchdog_diff({ baseRef: "v1.0.0", headRef: "release", path: "src", stat: true })
+```
+
+This compares the unique merge base of the two commits with `headRef`, equivalent to `git diff baseRef...headRef`. The default endpoint and the name `HEAD` refer to the captured launch commit. Other local branch names, tags, and revision expressions resolve to commit IDs on first use and stay pinned for subsequent narrowed calls. The result identifies both commits and their merge base. Invalid refs, unavailable commits, and missing or ambiguous merge bases fail instead of substituting a different target. Working-tree and untracked changes are excluded. `read` still inspects the current checkout, not historical file contents; do not treat it as evidence for a different endpoint.
+
+The tool executes fixed local Git operations with external diff and textconv programs disabled. It grants no shell, network, checkout, fetch, or write access. Ordinary watchdog reviews keep their existing session-start baseline when `baseRef` is omitted.
+
+Launch parent review workflows asynchronously (the default) so the parent can answer any supervisor questions. A committed range no longer requires a parent-generated diff artifact, but unavailable local commits still require supplied evidence or supervisor help.
+
 ## Choosing a model
 
 One model setting serves both boundary and cadence reviews per endpoint. Use a strong complementary model for rare adversarial boundary reviews, or a cheap one for frequent cadence monitoring.

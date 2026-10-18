@@ -303,6 +303,9 @@ describe("subagent prompt runtime", () => {
 		fs.writeFileSync(path.join(repo, "tracked.txt"), "base\n");
 		execFileSync("git", ["add", "."], { cwd: repo });
 		execFileSync("git", ["commit", "-q", "-m", "base"], { cwd: repo });
+		const base = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf-8" }).trim();
+		fs.writeFileSync(path.join(repo, "tracked.txt"), "committed feature\n");
+		execFileSync("git", ["commit", "-q", "-am", "feature"], { cwd: repo });
 
 		const registered = new Map<string, unknown>();
 		const handlers = new Map<string, Function>();
@@ -319,6 +322,10 @@ describe("subagent prompt runtime", () => {
 		const diffTool = registered.get("watchdog_diff") as { execute(id: string, params: object): Promise<{ content: Array<{ text: string }> }> };
 		const result = await diffTool.execute("review", {});
 		assert.match(result.content[0]?.text ?? "", /\+changed/);
+		const committed = await diffTool.execute("committed-review", { baseRef: base });
+		assert.match(committed.content[0]?.text ?? "", /\+committed feature/);
+		assert.doesNotMatch(committed.content[0]?.text ?? "", /\+changed/);
+		assert.equal(registered.has("bash"), false);
 		assert.equal(registered.has("contact_supervisor"), false, "reviewing the fixture needs no supervisor contact");
 
 		const outsideTools = new Map<string, unknown>();

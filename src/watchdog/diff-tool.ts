@@ -16,12 +16,19 @@ export interface WatchdogDiffBaseline {
 const WatchdogDiffParams = Type.Object({
 	path: Type.Optional(Type.String({ description: "Restrict the diff to one file or directory, relative to the repo root." })),
 	stat: Type.Optional(Type.Boolean({ description: "Return per-file change counts instead of the full diff." })),
+	baseRef: Type.Optional(Type.String({ minLength: 1, maxLength: 1024, description: "Review committed changes from this ref's merge base with headRef (git diff baseRef...headRef). Omit for working-tree changes." })),
+	headRef: Type.Optional(Type.String({ minLength: 1, maxLength: 1024, description: "Committed range endpoint; requires baseRef. Defaults to reviewer-launch HEAD. Refs are pinned on first use; use read to inspect files only when the checkout matches this endpoint." })),
 }, { additionalProperties: false });
 
 type WatchdogDiffParams = Static<typeof WatchdogDiffParams>;
 
-function runGit(root: string, args: string[]): { ok: boolean; stdout: string; stderr: string } {
-	const result = spawnSync("git", ["-C", root, ...args], { encoding: "utf-8", maxBuffer: 16 * 1024 * 1024, windowsHide: true });
+function runGit(root: string, args: string[]) {
+	const result = spawnSync("git", ["-C", root, ...args], {
+		encoding: "utf-8",
+		env: { ...process.env, GIT_NO_LAZY_FETCH: "1", GIT_OPTIONAL_LOCKS: "0" },
+		maxBuffer: 16 * 1024 * 1024,
+		windowsHide: true,
+	});
 	return { ok: result.status === 0, stdout: result.stdout ?? "", stderr: (result.stderr ?? "").trim() };
 }
 
@@ -59,6 +66,19 @@ function validatePath(value: string | undefined): string | undefined {
 	return trimmed;
 }
 
+function resolveRevision(root: string, ref: string, revisions: Map<string, string>): string {
+	if (!ref || ref.length > 1024 || ref.startsWith("-") || Array.from(ref).some((character) => character <= " " || character === "\u007f")) {
+		throw new Error("watchdog_diff received an invalid Git revision.");
+	}
+	const pinned = revisions.get(ref);
+	if (pinned) return pinned;
+	const result = runGit(root, ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`]);
+	if (!result.ok) throw new Error(`Cannot resolve Git revision ${JSON.stringify(ref)}: ${result.stderr || "unknown error"}`);
+	const commit = result.stdout.trim();
+	revisions.set(ref, commit);
+	return commit;
+}
+
 function bound(text: string): string {
 	if (text.length <= WATCHDOG_DIFF_MAX_CHARS) return text;
 	const marker = `\n\n[... ${text.length - WATCHDOG_DIFF_MAX_CHARS} characters omitted; call again with a narrower path ...]`;
@@ -71,14 +91,15 @@ export function createWatchdogDiffTool(
 	options: { workingTreeAtLaunch?: boolean } = {},
 ): AgentTool<typeof WatchdogDiffParams, { chars: number }> {
 	const workingTreeAtLaunch = options.workingTreeAtLaunch === true;
+	const revisions = new Map<string, string>(baseline ? [["HEAD", baseline.ref]] : []);
 	return {
 		name: WATCHDOG_DIFF_TOOL_NAME,
 		label: "Watchdog diff",
 		description: !baseline
 			? "Report that a Git HEAD diff baseline is unavailable in this cwd. No diff is generated."
 			: workingTreeAtLaunch
-			? "Show the current staged and unstaged working-tree delta against reviewer-launch HEAD, plus untracked file paths, including edits by other sessions in this checkout. Committed ranges are not included. Optional path narrows it; stat:true returns per-file counts only."
-			: "Show the repository diff since the review baseline, plus untracked file paths, including edits by other sessions in this checkout. Optional path narrows it; stat:true returns per-file counts only.",
+			? "Show staged and unstaged changes against reviewer-launch HEAD, plus untracked paths. Set baseRef to review committed baseRef...headRef changes instead, excluding working-tree changes; headRef defaults to launch HEAD. Refs are pinned on first use and resolved commits are reported. Optional path narrows either diff; stat:true returns per-file counts."
+			: "Show changes since the review baseline, plus untracked paths. Set baseRef to review committed baseRef...headRef changes instead; headRef defaults to the captured baseline. Optional path narrows either diff; stat:true returns per-file counts.",
 		parameters: WatchdogDiffParams,
 		executionMode: "sequential",
 		async execute(_toolCallId, params: WatchdogDiffParams) {
@@ -86,13 +107,27 @@ export function createWatchdogDiffTool(
 				return { content: [{ type: "text", text: WATCHDOG_DIFF_UNAVAILABLE_BASELINE }], details: { chars: WATCHDOG_DIFF_UNAVAILABLE_BASELINE.length } };
 			}
 			const pathFilter = validatePath(params.path);
-			const diff = runGit(baseline.root, ["diff", "--no-color", "--no-ext-diff", ...(params.stat === true ? ["--stat"] : []), baseline.ref, "--", ...(pathFilter ? [pathFilter] : [])]);
+			if (params.headRef !== undefined && params.baseRef === undefined) throw new Error("headRef requires baseRef.");
+			let range: { base: string; head: string; mergeBase: string } | undefined;
+			if (params.baseRef !== undefined) {
+				const base = resolveRevision(baseline.root, params.baseRef, revisions);
+				const head = resolveRevision(baseline.root, params.headRef ?? "HEAD", revisions);
+				const result = runGit(baseline.root, ["merge-base", "--all", base, head]);
+				const bases = result.stdout.trim().split(/\r?\n/).filter(Boolean);
+				if (!result.ok || bases.length !== 1) throw new Error("Cannot find a unique merge base for the requested committed range.");
+				range = { base, head, mergeBase: bases[0]! };
+			}
+			const diff = runGit(baseline.root, ["diff", "--no-color", "--no-ext-diff", "--no-textconv", ...(params.stat === true ? ["--stat"] : []), range?.mergeBase ?? baseline.ref, ...(range ? [range.head] : []), "--", ...(pathFilter ? [pathFilter] : [])]);
 			if (!diff.ok) throw new Error(`git diff failed: ${diff.stderr || "unknown error"}`);
+			if (range) {
+				const text = bound(`Committed range: ${range.base}...${range.head}\nMerge base: ${range.mergeBase}\n\n${diff.stdout.trimEnd() || "No committed changes in this range."}`);
+				return { content: [{ type: "text", text }], details: { chars: text.length } };
+			}
 			const untrackedResult = runGit(baseline.root, ["ls-files", "--others", "--exclude-standard", "-z", "--", ...(pathFilter ? [pathFilter] : [])]);
 			if (workingTreeAtLaunch) {
 				const currentHead = runGit(baseline.root, ["rev-parse", "HEAD"]);
 				if (!currentHead.ok || currentHead.stdout.trim() !== baseline.ref) {
-					const text = "Reviewer-launch HEAD changed or is unavailable. Committed changes are unsupported; relaunch the reviewer or supply a diff artifact.";
+					const text = "Reviewer-launch HEAD changed or is unavailable. Relaunch the reviewer or use baseRef for a committed range.";
 					return { content: [{ type: "text", text }], details: { chars: text.length } };
 				}
 			}
