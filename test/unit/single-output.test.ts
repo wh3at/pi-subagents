@@ -90,7 +90,7 @@ describe("injectSingleOutputInstruction", () => {
 		assert.match(output, /Ignore any other output filename or output path mentioned elsewhere/);
 	});
 
-	it("tells read-only agents, including the bundled reviewer profile, to return the artifact for runtime persistence", () => {
+	it("tells agents without write-capable tools to return the artifact for runtime persistence", () => {
 		for (const tools of [["read", "grep", "find", "ls"], ["read", "grep", "find", "ls", "watchdog_diff", "contact_supervisor"]]) {
 			const output = injectSingleOutputInstruction("Analyze this", "/tmp/report.md", { tools });
 			assert.match(output, /Return the complete artifact in your final response\./);
@@ -98,6 +98,22 @@ describe("injectSingleOutputInstruction", () => {
 			assert.match(output, /Do not call contact_supervisor merely because no write-capable tool is available\./);
 			assert.doesNotMatch(output, /Write your findings to exactly this path/);
 		}
+	});
+
+	it("persists a review returned without writing despite bash-capable output instructions", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-reviewer-output-"));
+		tempDirs.push(dir);
+		const outputPath = path.join(dir, "review.md");
+		const before = captureSingleOutputSnapshot(outputPath);
+		const tools = ["read", "grep", "find", "ls", "bash", "watchdog_diff", "contact_supervisor"];
+		const task = injectSingleOutputInstruction("Review only. Do not edit files.", outputPath, { tools });
+		assert.match(task, /Write your findings to exactly this path/);
+		const review = "No issues found.";
+		assert.equal(fs.existsSync(outputPath), false);
+		const result = resolveSingleOutput(outputPath, review, before);
+		assert.equal(result.fullOutput, review);
+		assert.equal(result.savedPath, outputPath);
+		assert.equal(fs.readFileSync(outputPath, "utf-8"), review);
 	});
 });
 

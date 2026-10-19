@@ -109,6 +109,20 @@ describe("child tool plan", () => {
 		assert.deepEqual(bundledReviewer.effectiveToolAllowlist, ["read", "watchdog_diff", "contact_supervisor"]);
 	});
 
+	it("keeps reviewer bash and watchdog_diff while respecting a read-only ceiling", () => {
+		const tools = ["read", "grep", "find", "ls", "bash", "watchdog_diff", "contact_supervisor"];
+		const plan = resolvePiLaunchToolPlan({ tools, agentName: "reviewer" });
+		assert.deepEqual(plan.effectiveToolAllowlist, tools);
+		assert.deepEqual(plan.requiredChildTools, tools.filter((tool) => tool !== "contact_supervisor"));
+		const allowedTools = tools.filter((tool) => tool !== "bash");
+		const restricted = resolvePiLaunchToolPlan({
+			tools, agentName: "reviewer",
+			capabilityCeiling: { version: 1, allowedTools, sources: ["test"] },
+		});
+		assert.deepEqual(restricted.effectiveToolAllowlist, allowedTools);
+		assert.deepEqual(restricted.requiredChildTools, allowedTools.filter((tool) => tool !== "contact_supervisor"));
+	});
+
 	it("fails a launch that selects MCP tools from the adapter's runtime snapshot", () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-runtime-mcp-"));
 		try {
