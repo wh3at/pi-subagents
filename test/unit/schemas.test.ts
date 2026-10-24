@@ -475,7 +475,7 @@ describe("SubagentParams schema", { skip: !schemasAvailable ? "typebox not avail
 		assert.match(String(properties.options?.description ?? ""), /acceptance, timeoutMs.*guide tool-reference\/parameter-reference/);
 		const { resolveDisabledFeatureSurface } = await import("../../src/shared/disabled-features.ts");
 		const structured = createProviderSchema!(resolveDisabledFeatureSurface({ disabledFeatures: ["workflow-scripts"] }));
-		assert.ok(JSON.stringify(structured).length <= 2_400, `expected structured schema at or under 2,400 chars, got ${JSON.stringify(structured).length}`);
+		assert.ok(JSON.stringify(structured).length <= 2_450, `expected structured schema at or under 2,450 chars, got ${JSON.stringify(structured).length}`);
 		assert.deepEqual(Object.keys(structured.properties as JsonSchemaNode), ["agent", "task", "tasks", "chain", "async", "model", "cwd", "worktree", "output", "action", "id", "message", "options"]);
 
 		const nestedDescriptionPaths: string[] = [];

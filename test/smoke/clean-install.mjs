@@ -1,14 +1,15 @@
-// Run with Node >=22.19.0: node --experimental-strip-types test/smoke/clean-install.mjs [artifact-dir] [0.86.1|1.0.0|1.2.0]
+// Run with Node >=22.19.0: node --experimental-strip-types test/smoke/clean-install.mjs [artifact-dir] [1.2.0]
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { registerHooks } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const source = fileURLToPath(new URL("../../", import.meta.url));
-const version = process.argv[3] ?? "0.86.1";
-const supportedVersions = ["0.86.1", "1.0.0", "1.2.0"];
+const version = process.argv[3] ?? "1.2.0";
+const supportedVersions = ["1.2.0"];
 assert.ok(supportedVersions.includes(version), `requires a supported smoke version: ${supportedVersions.join(", ")}`);
 const root = process.argv[2] ? path.resolve(process.argv[2]) : fs.mkdtempSync(path.join(os.tmpdir(), "clean-install-smoke-"));
 fs.mkdirSync(root, { recursive: true });
@@ -44,6 +45,7 @@ assert.ok(packed.files.some(file => file.path === "runner-peer-preload.mjs"), "p
 assert.ok(packed.files.some(file => file.path === "runner-peer-loader.mjs"), "older-Node peer loader must ship");
 assert.equal(packed.files.some(file => file.path.endsWith(".ts") && !file.path.endsWith(".d.ts")), false, "package must not ship TypeScript sources");
 assert.ok(packed.files.some(file => file.path === "index.js"), "compiled extension entry must ship");
+assert.ok(packed.files.some(file => file.path === "bundle/index.js"), "bundled extension entry must ship");
 assert.ok(packed.files.some(file => file.path === "src/inspectors/inspector-runner.js"), "compiled inspector runner must ship");
 assert.ok(packed.files.some(file => file.path === "src/runs/background/subagent-runner-bootstrap.js"), "compiled background bootstrap must ship");
 assert.ok(packed.files.some(file => file.path === "src/runs/background/subagent-runner.js"), "compiled background execution module must ship");
@@ -85,9 +87,18 @@ const entryLoader = createJiti(import.meta.url, {
 	alias: { "@earendil-works/pi-coding-agent": resolvePackageSubpath(pi, "."), ...resolved.aliases },
 });
 const entryStarted = performance.now();
-const entry = await entryLoader.import(path.join(installed, "index.js"));
-assert.equal(typeof entry.default, "function", "compiled extension entry must export its factory");
-console.log(`PASS compiled package entry loaded through Jiti in ${Math.round(performance.now() - entryStarted)} ms`);
+const [extensionEntry] = JSON.parse(fs.readFileSync(path.join(installed, "package.json"), "utf8")).pi.extensions;
+assert.equal(extensionEntry, "./bundle/index.js", "Pi must load the bundled extension entry");
+// A bundle module that imported its compiled copy would load that module's state a second time.
+const loadedUrls = [];
+registerHooks({ load(url, context, next) { loadedUrls.push(url); return next(url, context); } });
+const entry = await entryLoader.import(path.join(installed, extensionEntry));
+assert.equal(typeof entry.default, "function", "bundled extension entry must export its factory");
+console.log(`PASS bundled package entry loaded through Jiti in ${Math.round(performance.now() - entryStarted)} ms`);
+for (const file of fs.readdirSync(path.join(installed, "bundle"))) await entryLoader.import(path.join(installed, "bundle", file));
+const compiledSource = pathToFileURL(path.join(fs.realpathSync(installed), "src")).href + "/";
+assert.deepEqual(loadedUrls.filter((url) => url.startsWith(compiledSource)), [], "bundled modules must not load compiled modules");
+console.log("PASS bundled entry, subpath exports and lazy chunks load no compiled module");
 for (const file of ["sdk-child.ts", "sdk-extension.ts"]) fs.copyFileSync(new URL(file, import.meta.url), path.join(cwd, file));
 const childEnv = {
 	SMOKE_EXTENSION: installed,

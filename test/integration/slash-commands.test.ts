@@ -1416,6 +1416,41 @@ Inspect
 		assert.equal((visibleSnapshot.result.content[0] as { text?: string }).text, "Scout finished");
 	});
 
+	it("/run leaves the live-detail key out of its status when no expand key resolves", async () => {
+		const statuses: string[] = [];
+		const commands = new Map<string, { handler(args: string, ctx: unknown): Promise<void> }>();
+		const events = createEventBus();
+		events.on(SLASH_SUBAGENT_REQUEST_EVENT, (data) => {
+			const requestId = (data as { requestId: string }).requestId;
+			events.emit(SLASH_SUBAGENT_STARTED_EVENT, { requestId });
+			events.emit("subagent:slash:update", { requestId, toolCount: 3, currentTool: "read" });
+			events.emit(SLASH_SUBAGENT_RESPONSE_EVENT, {
+				requestId,
+				result: { content: [{ type: "text", text: "done" }], details: { mode: "single", results: [] } },
+				isError: false,
+			});
+		});
+		const pi = {
+			events,
+			registerCommand(name: string, spec: { handler(args: string, ctx: unknown): Promise<void> }) {
+				commands.set(name, spec);
+			},
+			registerShortcut() {},
+			sendMessage() {},
+		};
+
+		registerSlashCommands!(pi, createState(process.cwd()));
+		// The test process never loads Pi's app keybindings, like RPC mode.
+		await commands.get("run")!.handler("scout inspect this", createCommandContext({
+			hasUI: true,
+			setStatus: (_key, text) => {
+				if (text) statuses.push(text);
+			},
+		}));
+
+		assert.ok(statuses.includes("3 tools read"), JSON.stringify(statuses));
+	});
+
 	it("/run collapses tool detail before showing the initial live card", async () => {
 		const log: string[] = [];
 		const commands = new Map<string, { handler(args: string, ctx: unknown): Promise<void> }>();

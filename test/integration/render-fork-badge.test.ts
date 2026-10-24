@@ -45,7 +45,7 @@ const theme = {
 	getThinkingBorderColor: (_level: string) => (text: string) => text,
 };
 const expandKey = keyText("app.tools.expand");
-const expandHint = expandKey ? `Press ${expandKey} for full output` : "Configure the expand key for full output";
+const expandHint = expandKey ? `Press ${expandKey} for full output` : "Press the expand key for full output";
 
 const emptyUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
 
@@ -847,7 +847,7 @@ describe("renderSubagentResult fork indicator", () => {
 		}, { expanded: false }, theme);
 
 		const text = widget.render(120).join("\n");
-		assert.match(text, /Configure the expand key for live detail/);
+		assert.match(text, /Press the expand key for live detail/);
 		assert.match(text, /active 2s ago/);
 		assert.match(text, /⎿  read: package\.json \| 3\.0s/);
 		assert.match(text, /output: \/tmp\/reviewer_output\.md/);

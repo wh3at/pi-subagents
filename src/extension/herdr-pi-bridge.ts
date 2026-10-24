@@ -19,7 +19,6 @@ interface PendingRequest { operation: "prompt" | "steer" | "follow-up" | "abort"
 interface BridgeContext {
 	isIdle(): boolean;
 	hasPendingMessages(): boolean;
-	getActiveTools?(): string[];
 	sessionManager?: { getSessionId?(): string; getSessionFile?(): string | undefined };
 	model?: { provider?: string; id?: string };
 }
@@ -72,7 +71,8 @@ export default function registerHerdrPiBridge(pi: ExtensionAPI): void {
 		client.write(encodeHerdrPiFrame(record));
 	};
 	const sessionId = (ctx: BridgeContext) => ctx.sessionManager?.getSessionId?.();
-	const activeTools = (ctx: BridgeContext) => ctx.getActiveTools?.() ?? [];
+	// The active tool set lives on the Pi API, not on the event context.
+	const activeTools = (_ctx: BridgeContext) => pi.getActiveTools();
 
 	pi.registerTool({
 		name: "contact_supervisor",
@@ -111,7 +111,13 @@ export default function registerHerdrPiBridge(pi: ExtensionAPI): void {
 	pi.registerCommand("pi-subagents-bridge", { description: "Internal pane-native request dispatch", handler: (args, ctx) => execute(args.trim(), ctx as unknown as BridgeContext) });
 
 	const on = pi.on as unknown as (name: string, handler: (event: Record<string, unknown>, ctx: BridgeContext) => unknown) => void;
-	on("before_agent_start", (event) => resolvedSystemPrompt && resolvedContextPolicy ? { systemPrompt: `${rewriteSubagentPrompt(typeof event.systemPrompt === "string" ? event.systemPrompt : "", { inheritProjectContext: resolvedContextPolicy.inheritProjectContext, inheritGlobalContext: resolvedContextPolicy.inheritGlobalContext, inheritSkills: resolvedContextPolicy.inheritSkills })}\n\n<active_agent name=${JSON.stringify(resolvedContextPolicy.agent)}/>\n\n${resolvedSystemPrompt}` } : undefined);
+	on("before_agent_start", (event) => {
+		// The remote Pi fills its append slot from the remote operator's APPEND_SYSTEM.md; it is not the child's
+		// prompt, as for local children. Cleared before event.systemPrompt renders from these options.
+		const options = event.systemPromptOptions as { appendSystemPrompt?: unknown } | undefined;
+		if (typeof options?.appendSystemPrompt === "string") options.appendSystemPrompt = "";
+		return resolvedSystemPrompt && resolvedContextPolicy ? { systemPrompt: `${rewriteSubagentPrompt(typeof event.systemPrompt === "string" ? event.systemPrompt : "", { inheritProjectContext: resolvedContextPolicy.inheritProjectContext, inheritGlobalContext: resolvedContextPolicy.inheritGlobalContext, inheritSkills: resolvedContextPolicy.inheritSkills })}\n\n<active_agent name=${JSON.stringify(resolvedContextPolicy.agent)}/>\n\n${resolvedSystemPrompt}` } : undefined;
+	});
 	on("session_start", (_event, ctx) => {
 		context = ctx; nativeSessionId = sessionId(ctx);
 		if (!nativeSessionId) throw new Error("Pane-native Pi bridge requires a persisted native session identity.");

@@ -164,11 +164,36 @@ describe("structured workflow resources", () => {
 		assert.deepEqual(allOk.value, { ok: true, children: [{ key: "task-1", agent: "a", ok: true, output: "out:task-1" }] });
 	});
 
+	it("passes optional per-child cwd and model through to each launch", async () => {
+		const launched: Array<{ key: string; cwd: unknown; model: unknown }> = [];
+		const run = (script: string) => runWorkflowScript({
+			script,
+			timeoutMs: 5_000,
+			async launch(key, params) {
+				launched.push({ key, cwd: params.cwd, model: params.model });
+				return { key, ok: true, output: `out:${key}`, artifactPaths: [] };
+			},
+			async status(key) { return { key, ok: true, output: "unused", artifactPaths: [] }; },
+		});
+		await run(resolveScript({ kind: "tasks", steps: [{ agent: "a", task: "t", cwd: "/repo/a" }, { agent: "b", task: "t", model: "p/m" }] }));
+		await run(resolveScript({
+			kind: "chain",
+			steps: [{ agent: "a", task: "t", cwd: "/repo/a", model: "p/m" }, { parallel: [{ agent: "b", task: "{previous}", cwd: "/repo/b" }, { agent: "c", task: "t" }] }],
+		}));
+		assert.deepEqual(launched, [
+			{ key: "task-1", cwd: "/repo/a", model: undefined },
+			{ key: "task-2", cwd: undefined, model: "p/m" },
+			{ key: "step-1", cwd: "/repo/a", model: "p/m" },
+			{ key: "step-2-1", cwd: "/repo/b", model: undefined },
+			{ key: "step-2-2", cwd: undefined, model: undefined },
+		]);
+	});
+
 	it("embeds caller text as data, never as code", async () => {
 		const hostile = `"); await runs.host("x", { kind: "command", command: "bad", timeoutMs: 1 }); //\` \${globalThis.pwned = 1} ' `;
 		const agent = `worker"]); throw new Error("injected"); //`;
 		for (const kind of ["tasks", "chain"] as const) {
-			const script = resolveScript({ kind, task: hostile, steps: [{ agent, task: `${hostile} {task} \${1+1}` }] });
+			const script = resolveScript({ kind, task: hostile, steps: [{ agent, task: `${hostile} {task} \${1+1}`, cwd: hostile, model: hostile }] });
 			const { value, launches } = await runScript(script);
 			assert.deepEqual(launches.map(({ agent: launched, task }) => ({ agent: launched, task })), [{ agent, task: `${hostile} ${hostile} \${1+1}` }]);
 			assert.equal((value as { ok: boolean }).ok, true);
@@ -180,7 +205,9 @@ describe("structured workflow resources", () => {
 			[{ kind: "other" as "tasks", steps: [{ agent: "a", task: "t" }] }, /kind must be 'tasks' or 'chain'/],
 			[{ kind: "tasks", steps: [] }, /tasks must be a non-empty array/],
 			[{ kind: "chain", steps: { agent: "a", task: "t" } }, /chain must be a non-empty array/],
-			[{ kind: "tasks", steps: [{ agent: "a", task: "t", model: "x" }] }, /tasks\[0\] contains unsupported fields: model/],
+			[{ kind: "tasks", steps: [{ agent: "a", task: "t", thinking: "x" }] }, /tasks\[0\] contains unsupported fields: thinking/],
+			[{ kind: "tasks", steps: [{ agent: "a", task: "t", cwd: " " }] }, /tasks\[0\]\.cwd must not be empty/],
+			[{ kind: "tasks", steps: [{ agent: "a", task: "t", model: 1 }] }, /tasks\[0\]\.model must be a non-empty string/],
 			[{ kind: "tasks", steps: [{ agent: "a", task: "t", count: 2 }] }, /unsupported fields: count/],
 			[{ kind: "tasks", steps: [{ agent: "a" }] }, /tasks\[0\]\.task must be a non-empty string/],
 			[{ kind: "tasks", steps: [{ task: "t" }] }, /tasks\[0\]\.agent must be a non-empty string/],
@@ -195,7 +222,9 @@ describe("structured workflow resources", () => {
 			[{ kind: "chain", steps: [{ parallel: [{ agent: "a", task: "t" }], as: "x" }] }, /chain\[0\] contains unsupported fields: as\. A parallel step accepts only parallel/],
 			[{ kind: "chain", steps: [{ parallel: [{ agent: "a", task: "t" }], agent: "b" }] }, /unsupported fields: agent/],
 			[{ kind: "chain", steps: [{ parallel: [{ agent: "a", task: "t" }], failFast: true }] }, /unsupported fields: failFast/],
-			[{ kind: "chain", steps: [{ parallel: [{ agent: "a", task: "t", model: "m" }] }] }, /chain\[0\]\.parallel\[0\] contains unsupported fields: model/],
+			[{ kind: "chain", steps: [{ parallel: [{ agent: "a", task: "t", worktree: true }] }] }, /chain\[0\]\.parallel\[0\] contains unsupported fields: worktree/],
+			[{ kind: "chain", steps: [{ parallel: [{ agent: "a", task: "t" }], cwd: "/x" }] }, /chain\[0\] contains unsupported fields: cwd\. A parallel step accepts only parallel/],
+			[{ kind: "chain", steps: [{ agent: "a", task: "t", model: 2 }] }, /chain\[0\]\.model must be a non-empty string/],
 			[{ kind: "chain", steps: [{ parallel: [{ agent: "a" }] }] }, /chain\[0\]\.parallel\[0\]\.task must be a non-empty string/],
 			[{ kind: "chain", steps: [{ parallel: [] }] }, /chain\[0\]\.parallel must be a non-empty array/],
 			[{ kind: "chain", steps: [{ expand: {} }] }, /unsupported fields: expand/],

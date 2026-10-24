@@ -4,6 +4,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { HerdrMachineReference } from "../../shared/types.ts";
+import type { PlacementMachineAccess, PlacementSockets } from "./placement-host.ts";
 
 const MAX_DISCOVERY_BYTES = 256 * 1024;
 const MAX_RPC_BYTES = 4 * 1024 * 1024;
@@ -34,8 +35,13 @@ function sshEnvCommand(session: string | undefined, command: string): string { c
 export function runHerdrRemoteCommand(machine: HerdrMachineReference, command: string, options: { sshBin?: string; env?: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number } = {}) { return spawnSync(options.sshBin ?? "ssh", [...herdrSshArgs(options.env), machine.target, command], { encoding: "utf8", env: hardenedSshEnv(options.env), timeout: options.timeout ?? 15_000, maxBuffer: options.maxBuffer ?? MAX_DISCOVERY_BYTES, windowsHide: true }); }
 
 export function runHerdrRemoteCommandAsync(machine: HerdrMachineReference, command: string, options: { sshBin?: string; env?: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number } = {}): Promise<{ status: number | null; stdout: string; stderr: string; error?: Error }> {
+	return runBoundedCommand(options.sshBin ?? "ssh", [...herdrSshArgs(options.env), machine.target, command], { env: hardenedSshEnv(options.env), timeout: options.timeout, maxBuffer: options.maxBuffer });
+}
+
+/** Spawns one process with bounded output and a SIGTERM-then-SIGKILL timeout; never rejects. */
+export function runBoundedCommand(file: string, args: string[], options: { env: NodeJS.ProcessEnv; timeout?: number; maxBuffer?: number }): Promise<{ status: number | null; stdout: string; stderr: string; error?: Error }> {
 	return new Promise((resolve) => {
-		const child = spawn(options.sshBin ?? "ssh", [...herdrSshArgs(options.env), machine.target, command], { env: hardenedSshEnv(options.env), stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+		const child = spawn(file, args, { env: options.env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
 		const stdout: Buffer[] = [], stderr: Buffer[] = [], maxBuffer = options.maxBuffer ?? MAX_DISCOVERY_BYTES; let stdoutBytes = 0, stderrBytes = 0, error: Error | undefined, settled = false, escalation: NodeJS.Timeout | undefined;
 		const finish = (status: number | null, spawnError = error) => { if (settled) return; settled = true; clearTimeout(timer); if (escalation) clearTimeout(escalation); resolve({ status, stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8"), ...(spawnError ? { error: spawnError } : {}) }); };
 		const terminate = () => { child.kill("SIGTERM"); escalation ??= setTimeout(() => { if (!settled) { child.kill("SIGKILL"); finish(child.exitCode ?? null); } }, 1_000); escalation.unref?.(); };
@@ -116,9 +122,7 @@ async function waitForSocket(socketPath: string, child: ChildProcess): Promise<v
 }
 async function terminateChild(child: ChildProcess): Promise<void> { const wait = (ms: number) => child.exitCode !== null || child.signalCode !== null ? Promise.resolve() : Promise.race([new Promise<void>((resolve) => child.once("exit", () => resolve())), new Promise<void>((resolve) => setTimeout(resolve, ms))]); if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM"); await wait(1_000); if (child.exitCode === null && child.signalCode === null) { child.kill("SIGKILL"); await wait(1_000); } }
 
-export async function connectHerdrMachine(machine: HerdrMachineReference, options: { sshBin?: string; env?: NodeJS.ProcessEnv } = {}): Promise<HerdrForwardedConnection> {
-	if (process.platform === "win32") throw new Error("Pane-native Herdr placement requires OpenSSH StreamLocal forwarding and is not supported on Windows.");
-	const endpoint = await discoverHerdrEndpoint(machine, options);
+function openSshSockets(machine: HerdrMachineReference, options: { sshBin?: string; env?: NodeJS.ProcessEnv }): PlacementSockets {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-herdr-")); fs.chmodSync(dir, 0o700);
 	const children = new Set<ChildProcess>();
 	const forward = async (remotePath: string, name: string) => {
@@ -129,6 +133,18 @@ export async function connectHerdrMachine(machine: HerdrMachineReference, option
 		try { await waitForSocket(local, child); } catch (error) { await stop(); throw error; }
 		return { socketPath: local, close: stop };
 	};
-	const primary = await forward(endpoint.socket, "herdr").catch((error) => { fs.rmSync(dir, { recursive: true, force: true }); throw error; });
-	return { endpoint, socketPath: primary.socketPath, client: new SocketRpcClient(primary.socketPath), forwardRemoteSocket: forward, close: async () => { await Promise.all([...children].map(terminateChild)); children.clear(); fs.rmSync(dir, { recursive: true, force: true }); } };
+	return { forwardRemoteSocket: forward, close: async () => { await Promise.all([...children].map(terminateChild)); children.clear(); fs.rmSync(dir, { recursive: true, force: true }); } };
+}
+
+/** SSH machine access: hardened ssh commands and StreamLocal forwards that share one private local directory per socket scope. */
+export function sshMachineAccess(machine: HerdrMachineReference, options: { sshBin?: string; env?: NodeJS.ProcessEnv } = {}): PlacementMachineAccess {
+	return { shellCommand: remoteShellCommand, run: (command, limits = {}) => runHerdrRemoteCommand(machine, command, { ...options, ...limits }), runAsync: (command, limits = {}) => runHerdrRemoteCommandAsync(machine, command, { ...options, ...limits }), openSockets: () => openSshSockets(machine, options) };
+}
+
+export async function connectHerdrMachine(machine: HerdrMachineReference, options: { sshBin?: string; env?: NodeJS.ProcessEnv } = {}): Promise<HerdrForwardedConnection> {
+	if (process.platform === "win32") throw new Error("Pane-native Herdr placement requires OpenSSH StreamLocal forwarding and is not supported on Windows.");
+	const endpoint = await discoverHerdrEndpoint(machine, options);
+	const sockets = sshMachineAccess(machine, options).openSockets();
+	const primary = await sockets.forwardRemoteSocket(endpoint.socket, "herdr").catch(async (error) => { await sockets.close(); throw error; });
+	return { endpoint, socketPath: primary.socketPath, client: new SocketRpcClient(primary.socketPath), forwardRemoteSocket: sockets.forwardRemoteSocket, close: sockets.close };
 }

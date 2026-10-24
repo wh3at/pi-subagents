@@ -20,10 +20,15 @@ interface TemplateScope {
 	outputsUnavailable?: string;
 }
 
+/** Optional per-child launch fields copied verbatim onto the generated runs.all item. */
+const CHILD_FIELDS = ["cwd", "model"] as const;
+export const TOP_LEVEL_CONTROLS_HINT = " Put worktree and other child controls on the subagent call itself; they apply to every child.";
+
 interface StepChild {
 	key: string;
 	agent: string;
 	taskExpression: string;
+	fields: Partial<Record<(typeof CHILD_FIELDS)[number], string>>;
 }
 
 export function isPlainRecord(value: unknown): value is Record<string, unknown> {
@@ -77,8 +82,19 @@ function prelude(originalTask: string | undefined): string[] {
 	return originalTask === undefined ? [SETTLE_HELPER] : [SETTLE_HELPER, `const originalTask = ${JSON.stringify(originalTask)};`];
 }
 
+function childFields(record: Record<string, unknown>, path: string): StepChild["fields"] {
+	const fields: StepChild["fields"] = {};
+	for (const field of CHILD_FIELDS) {
+		if (record[field] !== undefined) fields[field] = nonEmptyString(record[field], `${path}.${field}`);
+	}
+	return fields;
+}
+
 function runsAllCall(children: readonly StepChild[]): string {
-	return `await runs.all([${children.map((child) => `{ key: ${JSON.stringify(child.key)}, agent: ${JSON.stringify(child.agent)}, task: ${child.taskExpression} }`).join(", ")}])`;
+	return `await runs.all([${children.map((child) => {
+		const fields = Object.entries(child.fields).map(([field, value]) => `, ${field}: ${JSON.stringify(value)}`).join("");
+		return `{ key: ${JSON.stringify(child.key)}, agent: ${JSON.stringify(child.agent)}, task: ${child.taskExpression}${fields} }`;
+	}).join(", ")}])`;
 }
 
 const SETTLE_HELPER = [
@@ -99,7 +115,7 @@ function buildTasksScript(steps: unknown, originalTask: string | undefined): str
 	if (!Array.isArray(steps) || steps.length === 0) throw new Error("tasks must be a non-empty array of { agent, task } items.");
 	const children = steps.map((item, index): StepChild => {
 		const path = `tasks[${index}]`;
-		const record = exactFields(item, path, ["agent", "task"], "Each tasks item accepts only agent and task.");
+		const record = exactFields(item, path, ["agent", "task", ...CHILD_FIELDS], `Each tasks item accepts agent and task, plus optional cwd and model.${TOP_LEVEL_CONTROLS_HINT}`);
 		const agent = nonEmptyString(record.agent, `${path}.agent`);
 		const task = nonEmptyString(record.task, `${path}.task`);
 		const taskExpression = compileTemplate(task, {
@@ -108,7 +124,7 @@ function buildTasksScript(steps: unknown, originalTask: string | undefined): str
 			previous: { unavailable: "tasks items may only use {task}." },
 			outputsUnavailable: "tasks items may only use {task}.",
 		});
-		return { key: `task-${index + 1}`, agent, taskExpression };
+		return { key: `task-${index + 1}`, agent, taskExpression, fields: childFields(record, path) };
 	});
 	return [
 		...prelude(originalTask),
@@ -133,18 +149,18 @@ function buildChainScript(steps: unknown, originalTask: string | undefined): str
 		let stepChildren: StepChild[];
 		let outputName: string | undefined;
 		if (isPlainRecord(step) && Object.hasOwn(step, "parallel")) {
-			const record = exactFields(step, path, ["parallel"], "A parallel step accepts only parallel; as is supported on sequential steps only.");
+			const record = exactFields(step, path, ["parallel"], `A parallel step accepts only parallel; as is supported on sequential steps only.${TOP_LEVEL_CONTROLS_HINT}`);
 			const items = record.parallel;
 			if (!Array.isArray(items) || items.length === 0) throw new Error(`${path}.parallel must be a non-empty array of { agent, task } items.`);
 			stepChildren = items.map((item, itemIndex): StepChild => {
 				const itemPath = `${path}.parallel[${itemIndex}]`;
-				const itemRecord = exactFields(item, itemPath, ["agent", "task"], "Each parallel item accepts only agent and task.");
+				const itemRecord = exactFields(item, itemPath, ["agent", "task", ...CHILD_FIELDS], `Each parallel item accepts agent and task, plus optional cwd and model.${TOP_LEVEL_CONTROLS_HINT}`);
 				const agent = nonEmptyString(itemRecord.agent, `${itemPath}.agent`);
 				const task = nonEmptyString(itemRecord.task, `${itemPath}.task`);
-				return { key: `step-${number}-${itemIndex + 1}`, agent, taskExpression: compileTemplate(task, { path: `${itemPath}.task`, hasOriginalTask, previous, outputs }) };
+				return { key: `step-${number}-${itemIndex + 1}`, agent, fields: childFields(itemRecord, itemPath), taskExpression: compileTemplate(task, { path: `${itemPath}.task`, hasOriginalTask, previous, outputs }) };
 			});
 		} else {
-			const record = exactFields(step, path, ["agent", "task", "as"], "A sequential step accepts only agent, task and as; a parallel step accepts only parallel.");
+			const record = exactFields(step, path, ["agent", "task", "as", ...CHILD_FIELDS], `A sequential step accepts agent, task, as, cwd and model; a parallel step accepts only parallel.${TOP_LEVEL_CONTROLS_HINT}`);
 			const agent = nonEmptyString(record.agent, `${path}.agent`);
 			let task: string;
 			if (record.task === undefined) {
@@ -156,7 +172,7 @@ function buildChainScript(steps: unknown, originalTask: string | undefined): str
 				if (outputs.has(record.as)) throw new Error(`${path}.as '${record.as}' is already used by an earlier step.`);
 				outputName = record.as;
 			}
-			stepChildren = [{ key: `step-${number}`, agent, taskExpression: compileTemplate(task, { path: `${path}.task`, hasOriginalTask, previous, outputs }) }];
+			stepChildren = [{ key: `step-${number}`, agent, fields: childFields(record, path), taskExpression: compileTemplate(task, { path: `${path}.task`, hasOriginalTask, previous, outputs }) }];
 		}
 		lines.push(
 			`const run${number} = ${runsAllCall(stepChildren)};`,

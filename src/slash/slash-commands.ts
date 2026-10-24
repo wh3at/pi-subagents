@@ -406,7 +406,7 @@ async function requestSlashRun(
 				const tool = update.currentTool ? ` ${update.currentTool}` : "";
 				const count = update.toolCount ?? 0;
 				const liveDetailKey = keyText("app.tools.expand");
-				ctx.ui.setStatus("subagent-slash", `${count} tools${tool} | ${liveDetailKey} live detail`);
+				ctx.ui.setStatus("subagent-slash", `${count} tools${tool}${liveDetailKey ? ` | ${liveDetailKey} live detail` : ""}`);
 			} catch (error) {
 				if (isStaleExtensionContextError(error)) {
 					finish(() => reject(error));

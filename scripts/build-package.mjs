@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { build } from "esbuild";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const output = path.join(root, "dist-pkg");
@@ -63,17 +64,54 @@ const publishedPackage = { type: sourcePackage.type };
 for (const field of copyFields) {
 	if (sourcePackage[field] !== undefined) publishedPackage[field] = sourcePackage[field];
 }
-publishedPackage.types = "./index.d.ts";
-publishedPackage.exports = Object.fromEntries(Object.entries(sourcePackage.exports).map(([name, target]) => {
+// The extension entry and every subpath export load from one bundled module graph (#2980).
+// Loading ~240 separate modules costs seconds on Windows; shared chunks keep one copy of module state.
+// The compiled files stay in the package for child processes, and each bundled module keeps the
+// import.meta.url of its compiled file, so paths to agents, prompts, runners and package.json do not change.
+const bundleEntries = Object.entries(sourcePackage.exports).map(([name, target]) => {
 	if (typeof target !== "string" || !target.endsWith(".ts")) throw new Error(`Unsupported package export ${name}: ${String(target)}`);
+	return { name, target, out: name === "." ? "index" : name.slice(2) };
+});
+const compiledModuleUrls = new Set();
+await build({
+	absWorkingDir: root,
+	entryPoints: bundleEntries.map(({ target, out }) => ({ in: target, out })),
+	outdir: path.join(output, "bundle"),
+	bundle: true,
+	splitting: true,
+	format: "esm",
+	platform: "node",
+	target: "node22",
+	packages: "external",
+	chunkNames: "chunk-[hash]",
+	logLevel: "warning",
+	plugins: [{
+		name: "compiled-module-url",
+		setup(bundler) {
+			bundler.onLoad({ filter: /\.ts$/ }, async (args) => {
+				const compiled = `${path.relative(root, args.path).split(path.sep).join("/").slice(0, -3)}.js`;
+				const source = await fs.promises.readFile(args.path, "utf8");
+				if (!source.includes("import.meta.url")) return { contents: source, loader: "ts" };
+				compiledModuleUrls.add(compiled);
+				const moduleUrl = `new URL(${JSON.stringify(`../${compiled}`)}, import.meta.url).href`;
+				return { contents: source.replaceAll("import.meta.url", moduleUrl), loader: "ts" };
+			});
+		},
+	}],
+});
+for (const compiled of compiledModuleUrls) {
+	if (!fs.existsSync(path.join(output, compiled))) throw new Error(`Bundled module points at a missing compiled file: ${compiled}`);
+}
+
+publishedPackage.types = "./index.d.ts";
+publishedPackage.exports = Object.fromEntries(bundleEntries.map(({ name, target, out }) => {
 	const base = target.slice(0, -3);
-	for (const extension of [".js", ".d.ts"]) {
-		if (!fs.existsSync(path.join(output, `${base.slice(2)}${extension}`))) throw new Error(`Missing compiled package export: ${base}${extension}`);
-	}
-	return [name, { types: `${base}.d.ts`, default: `${base}.js` }];
+	if (!fs.existsSync(path.join(output, `${base.slice(2)}.d.ts`))) throw new Error(`Missing compiled package export: ${base}.d.ts`);
+	if (!fs.existsSync(path.join(output, "bundle", `${out}.js`))) throw new Error(`Missing bundled package export: ./bundle/${out}.js`);
+	return [name, { types: `${base}.d.ts`, default: `./bundle/${out}.js` }];
 }));
 publishedPackage.pi = {
 	...sourcePackage.pi,
-	extensions: ["./index.js"],
+	extensions: ["./bundle/index.js"],
 };
 fs.writeFileSync(path.join(output, "package.json"), `${JSON.stringify(publishedPackage, null, 2)}\n`);

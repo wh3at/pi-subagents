@@ -246,7 +246,7 @@ const SubagentParamProperties = {
 	usageBudget: Type.Optional(UsageBudgetOverride),
 	agentScope: Type.Optional(Type.String({ description: "user/project/both (default); project wins collisions." })),
 	cwd: Type.Optional(Type.String({ description: "Execution/project-pane directory." })),
-	machine: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Herdr saved machine id or label; runs an external CLI agent there. cwd then means the directory on that machine." })),
+	machine: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Herdr saved machine id or label; runs an external CLI agent there. cwd then means the directory on that machine. \"local\" runs a Pi child in a Rex pane here." })),
 	artifacts: Type.Optional(Type.Boolean({ description: "Debug artifacts; default true." })),
 	includeProgress: Type.Optional(Type.Boolean({ description: "Full result progress; default false." })),
 	share: Type.Optional(Type.Boolean({ description: "Upload session to GitHub Gist; default false." })),
@@ -300,7 +300,7 @@ export const SubagentParams = keepTopLevelParameterDescriptions(Type.Object(Mode
 
 // Replaces workflow scripts when disabledFeatures lists "workflow-scripts". Kept small because every
 // field is sent on every request; the executor validates step shapes and placeholders strictly.
-const StructuredTask = { type: "object", properties: { agent: { type: "string", minLength: 1 }, task: { type: "string" } }, required: ["agent", "task"], additionalProperties: false };
+const StructuredTask = { type: "object", properties: { agent: { type: "string", minLength: 1 }, task: { type: "string" }, cwd: { type: "string" }, model: { type: "string" } }, required: ["agent", "task"], additionalProperties: false };
 const StructuredWorkflowProperties = {
 	action: Type.Optional(Type.String({ minLength: 1, description: "Management/control only; omit for execution. Discover actions with {action:\"guide\",options:{topic:\"tool-reference\"}}." })),
 	task: Type.Optional(Type.String({ description: "One-child task with agent, or the original request ({task}) with chain/tasks." })),
@@ -309,8 +309,8 @@ const StructuredWorkflowProperties = {
 	chain: Type.Optional(Type.Unsafe({
 		type: "array",
 		minItems: 1,
-		items: { type: "object", properties: { agent: { type: "string", minLength: 1 }, task: { type: "string" }, as: { type: "string" }, parallel: { type: "array", minItems: 1, items: StructuredTask } }, additionalProperties: false },
-		description: "Sequential steps: {agent,task?,as?} or {parallel:[{agent,task}]}.",
+		items: { type: "object", properties: { agent: { type: "string", minLength: 1 }, task: { type: "string" }, as: { type: "string" }, cwd: { type: "string" }, model: { type: "string" }, parallel: { type: "array", minItems: 1, items: StructuredTask } }, additionalProperties: false },
+		description: "Sequential steps: {agent,task?,as?,cwd?,model?} or {parallel:[{agent,task,cwd?,model?}]}.",
 	})),
 };
 

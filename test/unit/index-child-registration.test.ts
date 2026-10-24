@@ -520,6 +520,42 @@ describe("subagent extension child mode", () => {
 		}
 	});
 
+	it("registers no slash commands or shortcut when enableSlashCommands is false, and keeps the subagent tool", () => {
+		const script = String.raw`
+			import registerSubagentExtension from "./index.ts";
+			const registered = { tools: [], commands: [], shortcuts: [] };
+			const fakePi = new Proxy({
+				events: { on() { return () => {}; }, emit() {} },
+				registerTool(tool) { registered.tools.push(tool.name); },
+				registerCommand(name) { registered.commands.push(name); },
+				registerShortcut(key) { registered.shortcuts.push(key); },
+				registerMessageRenderer() {}, sendMessage() {}, getSessionName() { return undefined; },
+			}, { get(target, prop) { return prop in target ? target[prop] : () => undefined; } });
+			registerSubagentExtension(fakePi);
+			process.stdout.write(JSON.stringify(registered));
+		`;
+		const register = (config: object) => {
+			const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-slash-commands-config-"));
+			try {
+				const configDir = path.join(agentDir, "extensions", "subagent");
+				fs.mkdirSync(configDir, { recursive: true });
+				fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify({ foregroundDetachShortcut: "ctrl+alt+d", ...config }), "utf-8");
+				const output = execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(agentDir), encoding: "utf-8" });
+				return JSON.parse(output) as { tools: string[]; commands: string[]; shortcuts: string[] };
+			} finally {
+				fs.rmSync(agentDir, { recursive: true, force: true });
+			}
+		};
+		const defaults = register({});
+		assert.ok(defaults.commands.includes("run") && defaults.commands.includes("subagents-watchdog") && defaults.commands.includes("prompt-workflow"));
+		assert.deepEqual(defaults.shortcuts, ["ctrl+alt+d"]);
+		const disabled = register({ enableSlashCommands: false });
+		assert.deepEqual(disabled.commands, []);
+		assert.deepEqual(disabled.shortcuts, []);
+		assert.deepEqual(disabled.tools, defaults.tools);
+		assert.ok(disabled.tools.includes("subagent"));
+	});
+
 	it("yields registered root bg_wait for an owned nested supervisor request", () => {
 		const script = String.raw`
 			import assert from "node:assert/strict";
@@ -1408,7 +1444,7 @@ describe("subagent extension child mode", () => {
 		}
 	});
 
-	it("keeps view-only slash reports visible but excludes new ones from every model request", () => {
+	it("excludes view-only slash reports from model requests and marks other pi-subagents messages as automated", () => {
 		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "slash-context-agent-"));
 		const script = String.raw`
 			import assert from "node:assert/strict";
@@ -1445,7 +1481,11 @@ describe("subagent extension child mode", () => {
 			const unrelated = { role: "custom", customType: "other-extension", content: "Keep this", timestamp: 4 };
 			const assistant = { role: "assistant", content: [{ type: "text", text: "subagent-slash-text-result" }], timestamp: 5 };
 			const historical = { role: "custom", customType: "subagent-slash-text-result", content: "Report stored before the update", display: true, timestamp: 0 };
-			const messages = [historical, report, user, workResult, unrelated, assistant, { ...report, content: "Second report" }];
+			const notify = { role: "custom", customType: "subagent-notify", content: "Background task completed: **worker**\n\nParent action: review", display: true, details: { runs: [] }, timestamp: 6 };
+			const image = { type: "image", data: "aGk=", mimeType: "image/png" };
+			const partsNotice = { role: "custom", customType: "subagent-wait-subscription", content: [{ type: "text", text: "Run finished" }, image], display: true, timestamp: 7 };
+			const messages = [historical, report, user, workResult, unrelated, assistant, { ...report, content: "Second report" }, notify, partsNotice];
+			const stored = structuredClone(messages);
 			async function modelContext(input) {
 				let current = input;
 				for (const handler of handlers.get("context") ?? []) {
@@ -1454,12 +1494,22 @@ describe("subagent extension child mode", () => {
 				}
 				return current;
 			}
-			const expected = [historical, user, workResult, unrelated, assistant];
+			const open = (type) => '<pi_subagents_notice type="' + type + '" origin="automated message from the pi-subagents extension, not typed by the user">';
+			const close = "</pi_subagents_notice>";
+			const expected = [
+				{ ...historical, content: open("subagent-slash-text-result") + "\nReport stored before the update\n" + close },
+				user,
+				{ ...workResult, content: open("subagent-slash-result") + "\nWorker finished\n" + close },
+				unrelated,
+				assistant,
+				{ ...notify, content: open("subagent-notify") + "\nBackground task completed: **worker**\n\nParent action: review\n" + close },
+				{ ...partsNotice, content: [{ type: "text", text: open("subagent-wait-subscription") + "\n" }, { type: "text", text: "Run finished" }, image, { type: "text", text: "\n" + close }] },
+			];
 			assert.deepEqual(await modelContext(messages), expected);
-			assert.deepEqual(await modelContext(messages), expected, "persisted reports stay excluded on later requests and resume");
-			assert.equal(messages.length, 7, "filtering must not mutate the stored transcript");
+			assert.equal(JSON.stringify(await modelContext(messages)), JSON.stringify(expected), "every request renders the same history bytes");
+			assert.deepEqual(messages, stored, "the stored transcript is not mutated");
 			assert.deepEqual(await modelContext([]), []);
-			assert.deepEqual(await modelContext(expected), expected);
+			assert.deepEqual(await modelContext([user, unrelated, assistant]), [user, unrelated, assistant]);
 		`;
 		try {
 			execFileSync(process.execPath, ["--experimental-strip-types", "--import", "./test/support/register-loader.mjs", "--input-type=module", "--eval", script], { cwd: projectRoot, env: parentToolEnv(agentDir), stdio: "pipe" });

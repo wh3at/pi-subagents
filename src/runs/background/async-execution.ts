@@ -15,7 +15,7 @@ import { childCacheRetentionEnv } from "../../shared/child-cache-retention.ts";
 import { buildEffectiveSystemPrompt } from "../shared/effective-system-prompt.ts";
 import { currentCompletionOwnerId } from "../../shared/completion-owner.ts";
 import { planChildLaunch, projectChainOutputSchemas, resolveStepBehavior, suppressProgressForReadOnlyTask, type ResolvedStepBehavior } from "../shared/child-launch-plan.ts";
-import { formatHerdrMachineRunnerUnsupported, resolveHerdrMachinePlacement } from "../shared/herdr-machine.ts";
+import { formatHerdrMachineRunnerUnsupported, resolveMachinePlacement } from "../shared/herdr-machine.ts";
 import { applyThinkingSuffix, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/child-tool-plan.ts";
 import { assertClaudeCodeModelScope, isClaudeCodeAdapterId, resolveClaudeCodeOverride, type ClaudeCodeOverride } from "../shared/claude-code-adapter.ts";
 import { injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
@@ -23,7 +23,7 @@ import { applyWatchdogLaunchRules, sendRuleViolationWarning } from "../../watchd
 import { buildChainInstructions, getStepAgents, isDynamicParallelStep, isParallelStep, resolveExistingReadInstructionPaths, resolveExistingReadPaths, writeInitialProgressFile, type ChainStep, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
 import { isDynamicRunnerGroup, isParallelGroup, type RunnerStep } from "../shared/parallel-utils.ts";
 import type { ContextMode } from "../shared/context-mode.ts";
-import { PI_CODING_AGENT_PACKAGE, resolveBunPiExecutable, resolveInstalledPiPackageRoot, resolvePiPackageRoot } from "../shared/pi-spawn.ts";
+import { PI_CODING_AGENT_PACKAGE, resolveBunPiExecutable, resolveHostPiPackageRoot } from "../shared/pi-spawn.ts";
 import { JITI_ALIAS_ENV, resolveHostPeerAliases } from "./runner-aliases.ts";
 import { preflightLaunchCwd } from "../shared/launch-cwd.ts";
 import { resolveNodeExecutable } from "../../shared/node-executable.ts";
@@ -50,7 +50,7 @@ import {
 	type ArtifactConfig,
 	type Details,
 	type IntercomBridgeConfig,
-	type HerdrMachineReference,
+	type PlacementMachineReference,
 	type JsonSchemaObject,
 	type MaxOutputConfig,
 	type NestedRouteInfo,
@@ -96,22 +96,15 @@ import { assertWorkflowLaneKey, normalizeWorkflowLaneMetadata } from "../shared/
 import { assertRequiredChildExtensionsAdmitted, resolveRequiredChildExtensions, writeRetainedRequiredChildExtensions, type RequiredChildExtensionSnapshot } from "../../shared/required-child-extensions.ts";
 
 const require = nodeModule.createRequire(import.meta.url);
-const piPackageRoot = resolveAsyncPiPackageRoot();
-
-/**
- * The detached runner resolves the same host package the foreground
- * `resolvePiCliScript` path resolves, so an explicit
- * `PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT` override must be honored here
- * too. Precedence mirrors the foreground resolver: argv-based discovery wins
- * first (the foreground returns the argv script before any candidate), the
- * environment override is consulted when that discovery cannot identify the
- * host (wrapper installs, non-standard layouts), and the
- * package-manager entry is last. Without the override, such hosts fail
- * closed with "neither is available" while foreground children launch fine.
- */
-function resolveAsyncPiPackageRoot(env: NodeJS.ProcessEnv = process.env): string | undefined {
-	return resolvePiPackageRoot() || env[PI_CODING_AGENT_PACKAGE_ROOT_ENV]?.trim() || resolveInstalledPiPackageRoot();
-}
+// Cache failures as well as roots: management must remain loadable, and launches must not retry another SDK.
+const piPackageSelection = ((): { root?: string } | { error: unknown; root?: never } => {
+	try {
+		return { root: resolveHostPiPackageRoot() };
+	} catch (error) {
+		return { error };
+	}
+})();
+const piPackageRoot = piPackageSelection.root;
 
 function resolveJitiCliFromPackageJson(packageJsonPath: string): string | undefined {
 	if (!fs.existsSync(packageJsonPath)) return undefined;
@@ -685,6 +678,7 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 
 	// The compiled host exposes its SDK only through Pi's extension loader.
 	const binaryHost = resolveBunPiExecutable();
+	if (!binaryHost && "error" in piPackageSelection) throw piPackageSelection.error;
 	const nodeExecutable = resolveNodeExecutable();
 	const nativeRunnerSupported = supportsNativeRunner(nodeExecutable);
 	const runner = asyncRunnerSourcePath();
@@ -1084,11 +1078,11 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		} catch (error) {
 			throw new AsyncStartValidationError(error instanceof Error ? error.message : String(error));
 		}
-		let machine: HerdrMachineReference | undefined;
+		let machine: PlacementMachineReference | undefined;
 		let machineEnv: Record<string, string> | undefined;
 		if (requestedMachine) {
 			try {
-				const placement = resolveHerdrMachinePlacement({ machine: requestedMachine, cwd: runnerCwd, stepCwd: s.cwd ?? params.machineCwd });
+				const placement = resolveMachinePlacement({ machine: requestedMachine, cwd: runnerCwd, stepCwd: s.cwd ?? params.machineCwd });
 				machine = placement.machine;
 				machineEnv = placement.env;
 			} catch (error) {
@@ -1907,11 +1901,11 @@ export function executeAsyncSingle(
 	} catch (error) {
 		return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
 	}
-	let machine: HerdrMachineReference | undefined;
+	let machine: PlacementMachineReference | undefined;
 	let machineEnv: Record<string, string> | undefined;
 	if (requestedMachine) {
 		try {
-			const placement = resolveHerdrMachinePlacement({ machine: requestedMachine, cwd: runnerCwd, stepCwd: params.machineCwd });
+			const placement = resolveMachinePlacement({ machine: requestedMachine, cwd: runnerCwd, stepCwd: params.machineCwd });
 			machine = placement.machine;
 			machineEnv = placement.env;
 		} catch (error) {

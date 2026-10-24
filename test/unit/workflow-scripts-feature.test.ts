@@ -62,11 +62,12 @@ describe("workflow-scripts tool surface", () => {
 		const validator = Compile(schema);
 		assert.equal(validator.Check({ task: "ship it", tasks: [{ agent: "scout", task: "a" }, { agent: "reviewer", task: "b" }] }), true);
 		assert.equal(validator.Check({ task: "ship it", chain: [{ agent: "scout", task: "{task}", as: "scan" }, { parallel: [{ agent: "reviewer", task: "{outputs.scan}" }] }, { agent: "writer" }] }), true);
+		assert.equal(validator.Check({ tasks: [{ agent: "scout", task: "a", cwd: "/repo", model: "p/m" }], chain: [{ agent: "a", task: "t", cwd: "/r", model: "p/m" }, { parallel: [{ agent: "b", task: "t", cwd: "/r", model: "p/m" }] }] }), true, "children accept cwd and model");
 		assert.equal(validator.Check({ tasks: [{ agent: "scout" }] }), false, "tasks items require task");
-		assert.equal(validator.Check({ chain: [{ agent: "scout", model: "x" }] }), false, "chain steps reject other fields");
+		assert.equal(validator.Check({ chain: [{ agent: "scout", thinking: "x" }] }), false, "chain steps reject other fields");
 		assert.equal(validator.Check({ chain: [] }), false, "chain needs a step");
 		const serialized = JSON.stringify({ tasks: schema.properties.tasks, chain: schema.properties.chain });
-		assert.ok(serialized.length <= 750, `chain/tasks schema is ${serialized.length} chars`);
+		assert.ok(serialized.length <= 925, `chain/tasks schema is ${serialized.length} chars`);
 	});
 
 	it("replaces script guidance with chain/tasks guidance", () => {
@@ -75,7 +76,7 @@ describe("workflow-scripts tool surface", () => {
 			for (const script of ["```js workflow", "workflow:true", "runs.run", "runs.all", "runs.lanes", "runs.host", "Named resources", "validate", "args", "state.get", "Schedules take script inputs"]) {
 				assert.ok(!description.includes(script), `${toolDescriptionMode ?? "default"} description still mentions ${script}`);
 			}
-			for (const text of ["tasks:[{agent,task},...]", "chain:[{agent,task?,as?}", "{task}", "{previous}", "{outputs.name}", "SAFETY-CRITICAL SUBAGENT GUIDANCE", "exactly one top-level subagent chain or tasks call"]) {
+			for (const text of ["tasks:[{agent,task,cwd?,model?},...]", "chain:[{agent,task?,as?,cwd?,model?}", "{task}", "{previous}", "{outputs.name}", "SAFETY-CRITICAL SUBAGENT GUIDANCE", "exactly one top-level subagent chain or tasks call"]) {
 				assert.ok(description.includes(text), `${toolDescriptionMode ?? "default"} description lacks ${text}`);
 			}
 		}

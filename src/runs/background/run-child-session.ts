@@ -28,6 +28,8 @@ import { createReportedChildSessionInput, type InProcessChildLaunch } from "../s
 import { createPartialOutputTracker, formatPartialOutput, type PartialOutputCause } from "../shared/partial-output.ts";
 import { childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent, type ChildSessionFactory } from "../shared/child-session.ts";
 import { reconcileAttemptUsage } from "../shared/usage-reconciliation.ts";
+import { isOrdinaryToolForMidToolExit } from "../shared/process-signal.ts";
+import { STRUCTURED_OUTPUT_FOLLOW_UP } from "../shared/structured-output.ts";
 import { formatSteerMessage } from "../shared/subagent-prompt-runtime.ts";
 import type { SteerDeliveryStatus, SteerRequest } from "./control-channel.ts";
 import { takeMatchingAcceptedSteer, unconsumedSteerReason } from "./steering.ts";
@@ -112,7 +114,7 @@ export interface RunChildSessionResult {
 	toolCount: number;
 	durationMs: number;
 	model?: string;
-	nativeMachine?: { provider: "herdr"; machineId: string; initialGit?: import("../../shared/types.ts").HerdrRemoteGitStatus; finalGit?: import("../../shared/types.ts").HerdrRemoteGitStatus };
+	nativeMachine?: { provider: import("../../shared/types.ts").PlacementMachineReference["provider"]; machineId: string; initialGit?: import("../../shared/types.ts").HerdrRemoteGitStatus; finalGit?: import("../../shared/types.ts").HerdrRemoteGitStatus };
 	error?: string;
 	finalOutput: string;
 	outputState: SubagentOutputState;
@@ -627,7 +629,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 					toolCount,
 					durationMs: Date.now() - startedAt,
 					model,
-					nativeMachine: session?.machineEvidence ? { provider: "herdr", machineId: session.machineEvidence.machineId, ...(session.machineEvidence.initial ? { initialGit: session.machineEvidence.initial } : {}), ...(session.machineEvidence.final ? { finalGit: session.machineEvidence.final } : {}) } : undefined,
+					nativeMachine: session?.machineEvidence ? { provider: session.machineEvidence.provider, machineId: session.machineEvidence.machineId, ...(session.machineEvidence.initial ? { initialGit: session.machineEvidence.initial } : {}), ...(session.machineEvidence.final ? { finalGit: session.machineEvidence.final } : {}) } : undefined,
 					error: stopped ? stopMessage() : timedOut ? (error ?? timeoutMessage()) : interrupted || (forcedDrainAfterFinalSuccess && !forcedDrainAfterEmptyTerminal && !commandError) ? undefined : finalError,
 					finalOutput: (timedOut || stopped) && !finalOutput.trim() ? (stopped ? stopMessage() : error ?? timeoutMessage()) : finalOutput,
 					outputState: finalOutput.trim() ? "present" : "absent",
@@ -710,6 +712,22 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				if (interrupted || timedOut || stopped) abortChild();
 				messageBaseline = created.messages.length;
 				await created.prompt(input.prompt);
+				// A structured child that finished normally without calling structured_output gets one more turn (#2997).
+				if (input.launch.session.runtime.structuredOutput
+					&& !structuredOutputToolInvoked
+					&& !settled
+					&& !created.shutDown
+					&& !interrupted
+					&& !timedOut
+					&& !stopped
+					&& !forcedTermination
+					&& !error
+					&& !assistantError
+					&& !input.launch.capture.toolDiagnostic()
+					&& !(currentTool && isOrdinaryToolForMidToolExit(currentTool))) {
+					applyChildLifecycle("cancel-drain");
+					await created.prompt(STRUCTURED_OUTPUT_FOLLOW_UP);
+				}
 				promptSettled = true;
 				settle(undefined);
 			} catch (promptError) {
