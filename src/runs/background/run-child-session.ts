@@ -21,7 +21,7 @@ import {
 } from "../../watchdog/child-status.ts";
 import { projectChildLifecycle, type ChildLifecycleAction, type ChildLifecycleState } from "../shared/child-lifecycle.ts";
 import { formatSubagentModelVerificationError } from "../shared/model-resolution.ts";
-import { formatChildModelResolutionDiagnostic, isChildModelResolutionFailure } from "../shared/model-resolution-diagnostic.ts";
+import { formatChildModelResolutionDiagnostic, formatMissingParentProviderDiagnostic, isChildModelResolutionFailure } from "../shared/model-resolution-diagnostic.ts";
 import { isMutatingTool, resolveCurrentPath } from "../shared/long-running-guard.ts";
 import { effectiveToolTimeoutMs, formatToolTimeoutMessage, toolTimeoutCallKey } from "../shared/tool-timeout.ts";
 import { createReportedChildSessionInput, type InProcessChildLaunch } from "../shared/child-launch.ts";
@@ -105,6 +105,8 @@ export interface RunChildSessionInput {
 	modelVerificationRegistry?: Array<{ provider: string; id: string; fullId: string }>;
 	modelResponseAliases?: Record<string, string[]>;
 	mutationTools?: readonly string[];
+	/** Provider of the launch model that a parent extension registered and this child does not load. */
+	parentExtensionProvider?: string;
 }
 
 export interface RunChildSessionResult {
@@ -114,7 +116,7 @@ export interface RunChildSessionResult {
 	toolCount: number;
 	durationMs: number;
 	model?: string;
-	nativeMachine?: { provider: import("../../shared/types.ts").PlacementMachineReference["provider"]; machineId: string; initialGit?: import("../../shared/types.ts").HerdrRemoteGitStatus; finalGit?: import("../../shared/types.ts").HerdrRemoteGitStatus };
+	nativeMachine?: import("../../shared/types.ts").SingleResult["nativeMachine"];
 	error?: string;
 	finalOutput: string;
 	outputState: SubagentOutputState;
@@ -202,6 +204,8 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 		let queuedDrainHold = false;
 		let compactionStartedReceived = false;
 		let afterCompactionSettlement = false;
+		let terminalAgentEndReceived = false;
+		let compactionAfterFinalOpen = false;
 		let finalDrainTimer: NodeJS.Timeout | undefined;
 		let finalHardFinishTimer: NodeJS.Timeout | undefined;
 		let watchdogTailTimer: NodeJS.Timeout | undefined;
@@ -339,7 +343,8 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			if (promptSettled || finalDrainTimer || settled) return;
 			finalDrainTimer = setTimeout(() => {
 				if (settled || promptSettled) return;
-				if (input.launch.capture.finalDrainHeld() || observeQueuedDrainHold()) {
+				// Pi runs auto-compaction after the final agent_end and only then emits agent_settled.
+				if (input.launch.capture.finalDrainHeld() || observeQueuedDrainHold() || compactionAfterFinalOpen) {
 					finalDrainTimer = undefined;
 					armFinalDrainTimer();
 					return;
@@ -353,16 +358,22 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 					if (settled || promptSettled) return;
 					settle(undefined, true);
 				}, HARD_FINISH_MS);
-				finalHardFinishTimer.unref?.();
 			}, FINAL_STOP_GRACE_MS);
-			finalDrainTimer.unref?.();
 		}
-		const applyChildLifecycle = (action: ChildLifecycleAction): void => {
+		const applyChildLifecycle = (action: ChildLifecycleAction, event?: { type?: string; willRetry?: unknown }): void => {
 			if (action === "cancel-drain") {
-				cleanTerminalAssistantStopReceived = false;
+				// After a clean final stop, a non-retrying agent_end may be the child's last event
+				// (Pi may not emit agent_settled), so it re-arms the drain instead of cancelling it.
+				terminalAgentEndReceived = event?.type === "agent_end" && event.willRetry !== true && cleanTerminalAssistantStopReceived;
 				agentSettledReceived = false;
 				clearFinalDrainTimers();
 				clearWatchdogTailTimer();
+				if (terminalAgentEndReceived) {
+					startFinalDrain();
+					return;
+				}
+				cleanTerminalAssistantStopReceived = false;
+				compactionAfterFinalOpen = false;
 				return;
 			}
 			if (action === "start-drain") startFinalDrain();
@@ -427,10 +438,16 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 			if (event.type === "compaction_start") {
 				compactionStartedReceived = true;
 				if (agentSettledReceived) afterCompactionSettlement = true;
+				if (terminalAgentEndReceived) compactionAfterFinalOpen = true;
 			}
 			if (event.type === "compaction_end" && event.willRetry === true) {
 				compactionStartedReceived = false;
 				afterCompactionSettlement = false;
+			}
+			if (event.type === "compaction_end" && event.willRetry !== true && compactionAfterFinalOpen) {
+				compactionAfterFinalOpen = false;
+				clearFinalDrainTimers();
+				startFinalDrain();
 			}
 			if (event.type === "turn_start" || event.type === "agent_start" || event.type === "auto_retry_start") {
 				queuedDrainHold = false;
@@ -444,7 +461,7 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				agentSettledReceived = true;
 				afterCompactionSettlement = compactionStartedReceived;
 			}
-			applyChildLifecycle(lifecycleAction);
+			applyChildLifecycle(lifecycleAction, event);
 
 			if (isChildWatchdogStatusEvent(event)) {
 				if (!input.childWatchdog) return;
@@ -609,6 +626,13 @@ export function runChildSession(input: RunChildSessionInput): Promise<RunChildSe
 				&& terminalUsage.turns === 0
 				&& !input.launch.session.ambientExtensions) {
 				finalError = `${promptErrorMessage}\n\n${formatChildModelResolutionDiagnostic({ agent: input.launch.config.agent, model: input.launch.session.model, host: "runner", capabilityCeiling: input.launch.toolPlan.capabilityCeiling })}`;
+			} else if (input.parentExtensionProvider
+				&& session?.claimedProvider !== input.parentExtensionProvider
+				&& finalError !== undefined
+				&& (finalError === promptErrorMessage || finalError === assistantError)
+				&& toolCount === 0
+				&& messages.every((message) => message.role !== "assistant" || (message as { stopReason?: string }).stopReason === "error")) {
+				finalError = `${finalError}\n\n${formatMissingParentProviderDiagnostic({ agent: input.launch.config.agent, model: input.launch.session.model, provider: input.parentExtensionProvider, capabilityCeiling: input.launch.toolPlan.capabilityCeiling })}`;
 			}
 			const forcedDrainAfterFinalSuccess = (forced || forcedTermination) && (cleanTerminalAssistantStopReceived || agentSettledReceived) && !finalError;
 			const forcedDrainAfterEmptyTerminal = forcedDrainAfterFinalSuccess && hasEmptyTerminalAssistantResponse(messages);

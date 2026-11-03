@@ -59,6 +59,18 @@ export function parseFrontmatterList(raw: string | undefined): string[] | undefi
 		.filter(Boolean);
 }
 
+function unquoteName(value: string): string {
+	if (value.length >= 2 && ((value.startsWith("'") && value.endsWith("'")) || (value.startsWith('"') && value.endsWith('"')))) {
+		return value.slice(1, -1);
+	}
+	return value;
+}
+
+/** A tool or extension name list whose items may each be quoted, as in `"read", "bash"` or `- "read"`. */
+export function parseUnquotedList(raw: string | undefined): string[] | undefined {
+	return parseFrontmatterList(raw)?.map(unquoteName);
+}
+
 /**
  * Parse YAML frontmatter from agent/chain files.
  * Handles both flat (key: value) and nested block (key: \n  sub: val) values.
@@ -96,7 +108,8 @@ export function parseFrontmatter(content: string): { frontmatter: Record<string,
 		// neither end a pending list block nor become part of its value.
 		if (trimmed.startsWith("#") && !currentFolded && !currentLiteral) continue;
 
-		if (currentKey !== null && currentBlockLines !== null && (indent > (currentIndent ?? 0) || ((currentFolded || currentLiteral) && trimmed === ""))) {
+		// Exactly-empty lines belong to any pending block, not only to | and > scalars.
+		if (currentKey !== null && currentBlockLines !== null && (indent > (currentIndent ?? 0) || trimmed === "")) {
 			// This line is part of the current block value
 			currentBlockLines.push(line);
 			continue;
@@ -104,15 +117,7 @@ export function parseFrontmatter(content: string): { frontmatter: Record<string,
 
 		// Flush any pending block value
 		if (currentKey !== null && currentBlockLines !== null) {
-			// Strip the common leading whitespace from the block so the
-			// serializer can add its own indentation level.
-			const rawBlock = currentBlockLines.join("\n");
-			const leadingSpaces = rawBlock.match(/^[ \t]+(?=\S)/m);
-			const prefix = leadingSpaces?.[0] ?? "";
-			const stripped = prefix
-				? rawBlock.replace(new RegExp(`^${escapeRegex(prefix)}`, "gm"), "").replace(/^\n/, "")
-				: rawBlock;
-			frontmatter[currentKey] = currentFolded ? foldBlock(stripped) : stripped;
+			frontmatter[currentKey] = flushBlockLines(currentBlockLines, currentFolded, currentLiteral);
 			currentKey = null;
 			currentBlockLines = null;
 			currentIndent = null;
@@ -125,7 +130,11 @@ export function parseFrontmatter(content: string): { frontmatter: Record<string,
 			const [key, rawValueValue] = match.slice(1);
 			if (key === undefined || rawValueValue === undefined) continue;
 			const rawValue = rawValueValue.trim();
-			const isQuoted = (rawValue.startsWith('"') && rawValue.endsWith('"')) || (rawValue.startsWith("'") && rawValue.endsWith("'"));
+			const quote = rawValue[0];
+			const nameList = key === "tools" || key === "excludeTools" || key === "mutationTools" || key === "extensions" || key === "subagentOnlyExtensions";
+			// `"read", "bash"` starts and ends with a quote, but it is a list. Keep those item quotes for the splitter.
+			const quotedList = nameList && (quote === '"' || quote === "'") && (rawValue.includes(`${quote},`) || rawValue.includes(`, ${quote}`));
+			const isQuoted = !quotedList && (quote === '"' || quote === "'") && rawValue.endsWith(quote);
 			const value = isQuoted ? rawValue.slice(1, -1) : rawValue;
 			const isFolded = !isQuoted && (rawValue === ">" || rawValue === ">-");
 			const isLiteral = !isQuoted && (rawValue === "|" || rawValue === "|-");
@@ -142,19 +151,31 @@ export function parseFrontmatter(content: string): { frontmatter: Record<string,
 				frontmatter[key] = value;
 			}
 		}
-		// Lines that don't match a key pattern (e.g., comments, empty lines) are ignored
 	}
 
 	// Flush final block value
 	if (currentKey !== null && currentBlockLines !== null) {
-		const rawBlock = currentBlockLines.join("\n");
-		const leadingSpaces = rawBlock.match(/^[ \t]+(?=\S)/m);
-		const prefix = leadingSpaces?.[0] ?? "";
-		const stripped = prefix
-			? rawBlock.replace(new RegExp(`^${escapeRegex(prefix)}`, "gm"), "").replace(/^\n/, "")
-			: rawBlock;
-		frontmatter[currentKey] = currentFolded ? foldBlock(stripped) : stripped;
+		frontmatter[currentKey] = flushBlockLines(currentBlockLines, currentFolded, currentLiteral);
 	}
 
 	return { frontmatter, body };
+}
+
+function flushBlockLines(blockLines: string[], folded: boolean, literal: boolean): string {
+	let lines = blockLines;
+	if (!folded && !literal) {
+		// Drop exactly-empty edge lines, and every line from the first exactly-empty one after
+		// the last content line, so nested values without inner blank lines parse as before.
+		const end = lines.indexOf("", lines.findLastIndex((line) => line.trim() !== "") + 1);
+		lines = lines.slice(lines.findIndex((line) => line !== ""), end < 0 ? lines.length : end);
+	}
+	// Strip the common leading whitespace from the block so the
+	// serializer can add its own indentation level.
+	const rawBlock = lines.join("\n");
+	const leadingSpaces = rawBlock.match(/^[ \t]+(?=\S)/m);
+	const prefix = leadingSpaces?.[0] ?? "";
+	const stripped = prefix
+		? rawBlock.replace(new RegExp(`^${escapeRegex(prefix)}`, "gm"), "").replace(/^\n/, "")
+		: rawBlock;
+	return folded ? foldBlock(stripped) : stripped;
 }
