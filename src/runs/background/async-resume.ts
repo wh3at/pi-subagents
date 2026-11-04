@@ -472,7 +472,8 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 	const requireSessionFile = options.requireSessionFile ?? true;
 	const location = resolveAsyncRunLocation(params, asyncDirRoot, resultsDir);
 	if (!location.asyncDir && !location.resultPath) {
-		throw new Error("Async run not found. Provide id or dir.");
+		const requested = params.id ?? params.runId;
+		throw new Error(requested ? `Async run not found for '${requested}'.` : "Async run not found. Provide id or dir.");
 	}
 
 	const reconciliation = location.asyncDir
@@ -585,7 +586,7 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 		? intersectSubagentCapabilityCeilings(status?.admissionCapabilityCeiling, result?.admissionCapabilityCeiling)
 		: intersectSubagentCapabilityCeilings(status?.capabilityCeiling, statusSteps[index]?.capabilityCeiling, result?.capabilityCeiling, resultSteps[index]?.capabilityCeiling);
 	const managedWorktreeCwd = location.asyncDir
-		? resolveRetainedWorktreeCwd(parallelHandoffPath(location.asyncDir), runId, index)
+		? resolveRetainedWorktreeCwd(parallelHandoffPath(location.asyncDir), runId, index, statusSteps[index]?.worktreePath)
 		: undefined;
 	const resumeCwd = validateResumeCwd(runId, managedWorktreeCwd ?? status?.cwd ?? result?.cwd ?? recoveryDescriptor?.cwd);
 

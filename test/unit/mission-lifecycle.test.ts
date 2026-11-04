@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { validateMissionLaunch } from "../../src/missions/actions.ts";
+import { handleMissionAction, validateMissionLaunch } from "../../src/missions/actions.ts";
 import {
 	attachMissionToLaunchResult,
 	prepareMissionLaunch,
@@ -302,6 +302,101 @@ describe("mission launch lifecycle", () => {
 			assert.equal(completed?.runs[0]?.status, "complete");
 			assert.equal(completed?.runs[0]?.mode, "workflow");
 			assert.ok(completed?.artifacts.some((artifact) => artifact.kind === "output"));
+		} finally {
+			fs.rmSync(test.root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a mission waiting when a foreground run ends without accepted evidence", () => {
+		const test = projectFixture();
+		try {
+			const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 };
+			const launch = (title: string, acceptanceStatus: string) => {
+				const binding = prepareMissionLaunch({ params: { mission: { title }, task: "Do the work" }, projectRoot: test.projectRoot, config: test.missionConfig });
+				assert.ok(binding);
+				attachMissionToLaunchResult({
+					binding,
+					result: {
+						content: [{ type: "text", text: "Done." }],
+						details: {
+							mode: "single",
+							runId: `run-${acceptanceStatus}`,
+							results: [{ index: 0, agent: "worker", task: "Do the work", exitCode: 0, usage, acceptance: { status: acceptanceStatus } as never }],
+						},
+					},
+				});
+				return readMission(binding.location, binding.missionId).status;
+			};
+			assert.equal(launch("Self-reported", "review-required"), "waiting");
+			assert.equal(launch("Verified", "verified"), "completed");
+		} finally {
+			fs.rmSync(test.root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a mission waiting when an async run finished before its launch result was attached", () => {
+		const test = projectFixture();
+		try {
+			const asyncDir = path.join(test.root, "fast-run");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				state: "complete",
+				steps: [{ acceptance: { status: "review-required" } }],
+			}));
+			const binding = prepareMissionLaunch({ params: { mission: { title: "Fast run" }, task: "Do it" }, projectRoot: test.projectRoot, config: test.missionConfig });
+			assert.ok(binding);
+			attachMissionToLaunchResult({ binding, result: { content: [{ type: "text", text: "Async started" }], details: { mode: "single", runId: "fast-1", asyncId: "fast-1", asyncDir, results: [] } } });
+			assert.equal(readMission(binding.location, binding.missionId).status, "waiting");
+		} finally {
+			fs.rmSync(test.root, { recursive: true, force: true });
+		}
+	});
+
+	it("completes a default mission when its async run ends without accepted evidence", () => {
+		const test = projectFixture();
+		try {
+			const asyncDir = path.join(test.root, "default-run");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			const binding = prepareMissionLaunch({ params: { task: "Edit the file" }, projectRoot: test.projectRoot, config: test.missionConfig });
+			assert.ok(binding);
+			attachMissionToLaunchResult({ binding, result: { content: [{ type: "text", text: "Async started" }], details: { mode: "single", runId: "default-1", asyncId: "default-1", asyncDir, results: [] } } });
+			const done = syncMissionFromAsyncCompletion({ runId: "default-1", asyncDir, mode: "single", state: "complete", success: true, results: [{ acceptance: { status: "review-required" } }] });
+			assert.equal(done?.status, "completed");
+		} finally {
+			fs.rmSync(test.root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a requested mission waiting when mission.show sees a finished run that needs review", () => {
+		const test = projectFixture();
+		try {
+			const asyncDir = path.join(test.root, "shown-run");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			const binding = prepareMissionLaunch({ params: { mission: { title: "Shown" }, task: "Do it" }, projectRoot: test.projectRoot, config: test.missionConfig });
+			assert.ok(binding);
+			attachMissionToLaunchResult({ binding, result: { content: [{ type: "text", text: "Async started" }], details: { mode: "single", runId: "shown-1", asyncId: "shown-1", asyncDir, results: [] } } });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ state: "complete", steps: [{ acceptance: { status: "review-required" } }] }));
+			const shown = handleMissionAction("mission.show", { missionId: binding.missionId }, { cwd: test.projectRoot, config: test.missionConfig });
+			assert.equal(shown.details?.mission?.status, "waiting");
+		} finally {
+			fs.rmSync(test.root, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps an async workflow mission waiting when a child result needs review", () => {
+		const test = projectFixture();
+		try {
+			const workflowDir = path.join(test.root, "workflow-run");
+			const childDir = path.join(test.root, "child-run");
+			fs.mkdirSync(workflowDir, { recursive: true });
+			fs.mkdirSync(childDir, { recursive: true });
+			const binding = prepareMissionLaunch({ params: { mission: { title: "Draft the approval email" }, task: "Draft it" }, projectRoot: test.projectRoot, config: test.missionConfig });
+			assert.ok(binding);
+			attachMissionToLaunchResult({ binding, result: { content: [{ type: "text", text: "Async started" }], details: { mode: "workflow", runId: "workflow-1", asyncId: "workflow-1", asyncDir: workflowDir, results: [] } } });
+			attachMissionToLaunchResult({ binding, result: { content: [{ type: "text", text: "Child started" }], details: { mode: "single", runId: "child-1", asyncId: "child-1", asyncDir: childDir, results: [] } } });
+			syncMissionFromAsyncCompletion({ runId: "child-1", asyncDir: childDir, mode: "single", state: "complete", success: true, parentWorkflowRunId: "workflow-1", workflowKey: "draft-email", results: [{ acceptance: { status: "review-required" } }] });
+			const workflowDone = syncMissionFromAsyncCompletion({ runId: "workflow-1", asyncDir: workflowDir, mode: "workflow", state: "complete", success: true, results: [] });
+			assert.equal(workflowDone?.status, "waiting");
 		} finally {
 			fs.rmSync(test.root, { recursive: true, force: true });
 		}

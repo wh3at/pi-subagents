@@ -8,7 +8,7 @@ import { handleManagementAction } from "../../src/agents/agent-management.ts";
 import { serializeAgent } from "../../src/agents/agent-serializer.ts";
 import { parseChain, serializeChain } from "../../src/agents/chain-serializer.ts";
 import { discoverAgents, discoverAgentsAll, inspectAgentDefinitionDirectory, type AgentConfig } from "../../src/agents/agents.ts";
-import { parseFrontmatter, parseFrontmatterList } from "../../src/agents/frontmatter.ts";
+import { parseFrontmatter, parseFrontmatterList, parseUnquotedList } from "../../src/agents/frontmatter.ts";
 import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
 import { applyThinkingSuffix } from "../../src/runs/shared/child-tool-plan.ts";
 import { THINKING_LEVELS } from "../../src/shared/model-info.ts";
@@ -276,6 +276,40 @@ body`);
 	});
 });
 
+describe("quoted names in tool and extension lists", () => {
+	it("reads each quoted item without its quote marks", () => {
+		const toolsOf = (value: string) => parseUnquotedList(parseFrontmatter(`---\ntools: ${value}\nname: worker\n---\nbody`).frontmatter.tools);
+		assert.deepEqual(toolsOf('"read", "bash"'), ["read", "bash"]);
+		assert.deepEqual(toolsOf("'read', 'bash'"), ["read", "bash"]);
+		assert.deepEqual(toolsOf('"read"'), ["read"]);
+		assert.deepEqual(parseUnquotedList(parseFrontmatter('---\ntools:\n  - "read"\n  - bash\nname: worker\n---\nbody').frontmatter.tools), ["read", "bash"]);
+		assert.deepEqual(toolsOf("false"), ["false"]);
+		assert.equal(parseUnquotedList(undefined), undefined);
+		const description = parseFrontmatter('---\ndescription: "Review \\"a\\", then continue"\nname: worker\n---\nbody');
+		assert.equal(description.frontmatter.description, 'Review \\"a\\", then continue');
+	});
+
+	it("loads quoted tools and extension paths as plain names", () => withTempHome(() => {
+		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-quoted-project-"));
+		tempDirs.push(project);
+		const agentFile = path.join(project, ".pi", "agents", "reviewer.md");
+		writeAgent(agentFile, [
+			"---",
+			"name: reviewer",
+			"description: Reviews with quoted tools",
+			'tools: "read", "bash"',
+			`extensions: "./ext/a.ts", './ext/b.ts'`,
+			"---",
+			"Review.",
+			"",
+		].join("\n"));
+		const agent = discoverAgents(project, "project").agents.find((item) => item.name === "reviewer");
+		assert.deepEqual(agent?.tools, ["read", "bash"]);
+		const agentDir = path.dirname(agentFile);
+		assert.deepEqual(agent?.extensions, [path.resolve(agentDir, "ext/a.ts"), path.resolve(agentDir, "ext/b.ts")]);
+	}));
+});
+
 describe("frontmatter comments", () => {
 	const toolsOf = (frontmatter: string) => parseFrontmatterList(parseFrontmatter(`---\n${frontmatter}\nname: worker\n---\nbody`).frontmatter.tools);
 
@@ -300,6 +334,35 @@ notes: >
 body`);
 		assert.equal(parsed.frontmatter.description, "first\n# kept");
 		assert.equal(parsed.frontmatter.notes, "one # two");
+	});
+});
+
+describe("blank lines in nested frontmatter blocks", () => {
+	const fm = (body: string) => parseFrontmatter(`---\n${body}---\npayload`);
+
+	it("preserves a nested block value across exactly-empty lines", () => {
+		const parsed = fm("runner:\n  type: external-cli\n  command: python3\n  args:\n    - -c\n    - |\n      import hashlib\n\n      x = 1\n      print('ok')\nname: t\n");
+		assert.equal(parsed.frontmatter.runner, "type: external-cli\ncommand: python3\nargs:\n  - -c\n  - |\n    import hashlib\n\n    x = 1\n    print('ok')");
+		assert.equal(parsed.frontmatter.name, "t");
+	});
+
+	it("keeps list items after an exactly-empty line and drops no comment into the list", () => {
+		const parsed = fm("tools:\n  - read\n\n# note\n\n  - bash\nname: x\n");
+		assert.deepEqual(parseFrontmatterList(parsed.frontmatter.tools), ["read", "bash"]);
+		assert.equal(parsed.frontmatter.name, "x");
+	});
+
+	it("keeps edge blank lines out of nested block values", () => {
+		assert.equal(fm("runner:\n  type: x\n\nname: z\n").frontmatter.runner, "type: x");
+		assert.equal(fm("runner:\n  type: x\n\n").frontmatter.runner, "type: x");
+		assert.equal(fm("runner:\n\n\n  type: x\n").frontmatter.runner, "type: x");
+		assert.equal(fm("runner:\n  type: x\n  \nname: z\n").frontmatter.runner, "type: x\n");
+		assert.equal(fm("async:\n  true\n\n  \nname: x\n").frontmatter.async, "true");
+	});
+
+	it("leaves literal and folded block edges unchanged", () => {
+		assert.equal(fm("prompt: |\n  hello\n\nname: x\n").frontmatter.prompt, "hello\n");
+		assert.equal(fm("description: >\n  normal\n\n  next\nname: x\n").frontmatter.description, "normal\nnext");
 	});
 });
 

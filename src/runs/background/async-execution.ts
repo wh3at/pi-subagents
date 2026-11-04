@@ -9,13 +9,14 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import * as nodeModule from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ParentProviderRegistry } from "../shared/child-session.ts";
 import { discoverAgents, formatUnknownAgentError, unknownAgentDiagnosticContext, type AgentConfig, type UnknownAgentDiagnosticContext } from "../../agents/agents.ts";
 import { createAtomicJsonWriter, writePrivateAtomicJson } from "../../shared/atomic-json.ts";
 import { childCacheRetentionEnv } from "../../shared/child-cache-retention.ts";
 import { buildEffectiveSystemPrompt } from "../shared/effective-system-prompt.ts";
 import { currentCompletionOwnerId } from "../../shared/completion-owner.ts";
 import { planChildLaunch, projectChainOutputSchemas, resolveStepBehavior, suppressProgressForReadOnlyTask, type ResolvedStepBehavior } from "../shared/child-launch-plan.ts";
-import { formatHerdrMachineRunnerUnsupported, resolveMachinePlacement } from "../shared/herdr-machine.ts";
+import { formatHerdrMachineRunnerUnsupported, PLACED_RESTORE_UNSUPPORTED, resolveMachinePlacement } from "../shared/herdr-machine.ts";
 import { applyThinkingSuffix, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/child-tool-plan.ts";
 import { assertClaudeCodeModelScope, isClaudeCodeAdapterId, resolveClaudeCodeOverride, type ClaudeCodeOverride } from "../shared/claude-code-adapter.ts";
 import { injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
@@ -83,8 +84,9 @@ import { finalizeProcessTerminal, initializeProcessTerminal, readProcessTerminal
 import { persistRunnerStartupFailure } from "./runner-startup-failure.ts";
 import type { ActiveAsyncCapacityHandle } from "./active-async-capacity.ts";
 import { statusStepDescription } from "./chain-append.ts";
+import { currentBootId, currentRecordedPid } from "./boot-id.ts";
 import { currentPidNamespaceScope } from "./pid-namespace.ts";
-import { checkPidLiveness } from "./stale-run-reconciler.ts";
+import { checkRecordedPidLiveness } from "./stale-run-reconciler.ts";
 import { lookupRunnerLauncher, resolveAgentRunnerLauncher, runnerLauncherPlacementError } from "../shared/runner-launcher.ts";
 import { SUBAGENT_PROCESS_TERMINAL_EVENT, type RunnerLauncher } from "../../shared/types.ts";
 import { assertAgentAllowedByCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
@@ -171,7 +173,7 @@ interface AsyncExecutionContext {
 	cwd: string;
 	currentSessionId: string;
 	completionOwnerId?: string;
-	/** Parent session id used by permission-system ask forwarding. */
+	/** Parent Pi session id (`getSessionId()`): keys permission-system ask forwarding and capability ceilings. */
 	parentSessionId?: string;
 	/** Parent session file, recorded as each new child session's `parentSession` header. */
 	parentSessionFile?: string;
@@ -190,6 +192,19 @@ interface AsyncExecutionContext {
 	childRuntime?: ChildRuntimeConfig;
 	/** The launching session's project trust; undefined when the host has no trust concept. */
 	projectTrusted?: boolean;
+	/** The parent's model registry, read at launch to name a provider an extension registered there. */
+	parentProviderRegistry?: Pick<ParentProviderRegistry, "getRegisteredProviderIds">;
+}
+
+/**
+ * A runner child without the ambient extensions does not load the parent extension that
+ * registered its model's provider, and still resolves the model when a built-in provider
+ * has the same id. Name that provider so a failed run can say so.
+ */
+function parentExtensionProviderForChild(ctx: AsyncExecutionContext, disableAmbientExtensions: boolean, model: string | undefined, availableModels: AvailableModelInfo[] | undefined, preferredProvider: string | undefined): string | undefined {
+	if (!disableAmbientExtensions || !ctx.parentProviderRegistry) return undefined;
+	const provider = findModelInfo(model, availableModels, preferredProvider)?.provider;
+	return provider && ctx.parentProviderRegistry.getRegisteredProviderIds().includes(provider) ? provider : undefined;
 }
 
 export const DEFAULT_ASYNC_TIMEOUT_MS = 30 * 60 * 1000;
@@ -703,7 +718,12 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 	const runnerProcessInstanceId = randomUUID();
 	const hasRevivalLease = typeof (cfg as { revivalLease?: unknown }).revivalLease === "object";
 	const launchBarrierToken = hasRevivalLease ? undefined : runnerProcessInstanceId;
-	const launchConfig = { ...cfg, runnerProcessInstanceId, ...(launchBarrierToken ? { launchBarrierToken } : {}) };
+	// A broker launcher may start the runner outside its own process, even under another kernel, so the
+	// spawned pid is only the wrapper's and only a direct runner shares Pi's boot id. The runner reports
+	// its own identity before it is allowed to proceed.
+	const launcher = (cfg as { launcher?: RunnerLauncher }).launcher;
+	const bootId = launcher ? undefined : currentBootId();
+	const launchConfig = { ...cfg, runnerProcessInstanceId, ...(launchBarrierToken ? { launchBarrierToken } : {}), ...(bootId ? { bootId } : {}) };
 	writePrivateAtomicJson(cfgPath, launchConfig);
 	const command = binaryHost ?? nodeExecutable;
 	const launchForStartup = launchConfig as typeof launchConfig & { asyncDir?: unknown; id?: unknown; sessionId?: unknown; completionOwnerId?: unknown; revivalLease?: unknown };
@@ -723,9 +743,6 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 	if (startupAckPath) fs.rmSync(startupAckPath, { force: true });
 	if (startupConfirmPath) fs.rmSync(startupConfirmPath, { force: true });
 	if (startupProceedPath) fs.rmSync(startupProceedPath, { force: true });
-	// A broker launcher may start the runner outside its own process, so the spawned pid is only the
-	// wrapper's. The runner reports its own identity before it is allowed to proceed.
-	const launcher = (launchConfig as { launcher?: RunnerLauncher }).launcher;
 	const identityPath = launcher && launchBarrierToken && launchAsyncDir ? path.join(launchAsyncDir, "runner-startup.json") : undefined;
 	if (identityPath) fs.rmSync(identityPath, { force: true });
 	let runnerIdentity: { pid: number; pidNamespaceScope?: string } | undefined;
@@ -811,7 +828,8 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 				}
 				// The runner may outlive its wrapper; only a confirmed-dead runner in this pid namespace finalizes here,
 				// otherwise status-pid reconciliation does it later.
-				if (!runnerIdentity || runnerIdentity.pidNamespaceScope !== currentPidNamespaceScope() || checkPidLiveness(runnerIdentity.pid, process.kill, runnerIdentity.pidNamespaceScope !== undefined) !== "dead") return;
+				if (!runnerIdentity || runnerIdentity.pidNamespaceScope !== currentPidNamespaceScope()
+					|| checkRecordedPidLiveness(runnerIdentity) !== "dead") return;
 			}
 			finalizeProcessTerminal(asyncDir, runId, {
 				processInstanceId: runnerProcessInstanceId,
@@ -867,7 +885,7 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 		try {
 			writePrivateAtomicJson(initialStatusPath, {
 				...initialStatus,
-				...(launcher ? {} : { pid: proc.pid, pidNamespaceScope: currentPidNamespaceScope() }),
+				...(launcher ? {} : { pid: proc.pid, pidNamespaceScope: currentPidNamespaceScope(), ...(bootId ? { bootId } : {}) }),
 				processTerminal: { version: 1, state: "pending", runId: initialStatus.runId, runnerProcessInstanceId },
 			});
 			// Aggregate waits must see the launch before the runner's first status update.
@@ -1243,6 +1261,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			runtimeSnapshotHost: ctx.pi,
 		});
 		const launchResolvedExtensions = externalRunner ? undefined : projectLaunchResolvedChildExtensions(toolPlan);
+		const parentExtensionProvider = externalRunner || machine ? undefined : parentExtensionProviderForChild(ctx, toolPlan.disableAmbientExtensions, selectedModel, availableModels, a.modelProvider ?? ctx.currentModelProvider);
 		if (externalRunner && permissionRules) {
 			throw new AsyncStartValidationError(`Agent '${a.name}' uses runner.type='${externalRunnerType}', which cannot enforce native Pi child permission rules.`);
 		}
@@ -1272,6 +1291,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			thinking: resolveEffectiveThinking(selectedModel, effectiveThinking),
 			...(thinkingCeiling ? { thinkingCeiling } : {}),
 			launchResolvedExtensions,
+			...(parentExtensionProvider ? { parentExtensionProvider } : {}),
 			...(requestedModel ? { requestedModel } : {}),
 			...(primaryModelFromParent ? { skipPrimaryModelVerification: true } : {}),
 			...(availableModels && availableModels.length > 0 ? { modelVerificationRegistry: availableModels } : {}),
@@ -1499,7 +1519,8 @@ export function executeAsyncChain(
 	const undefinedLauncher = chain.flatMap(getStepAgents).map((name) => agents.find((agent) => agent.name === name)?.launcher)
 		.find((name) => name !== undefined && !lookupRunnerLauncher(ctx.runnerLaunchers, name));
 	if (undefinedLauncher !== undefined) return formatAsyncStartError(resultMode, `Launcher '${undefinedLauncher}' used by this ${resultMode} is not defined in runnerLaunchers in the user subagent config.`);
-	const capabilityCeiling = params.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId);
+	const launchParentSessionId = ctx.parentSessionId ?? ctx.currentSessionId;
+	const capabilityCeiling = params.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(launchParentSessionId);
 	const inheritedNestedRoute = inheritedNestedRouteOf(ctx.childRuntime);
 	const nestedAddress = inheritedNestedRoute ? inheritedNestedParentAddressOf(ctx.childRuntime) : undefined;
 	const asyncDir = inheritedNestedRoute
@@ -1598,7 +1619,7 @@ export function executeAsyncChain(
 	}
 	const initialStatusAt = Date.now();
 	const initialCompletionOwnerId = ctx.completionOwnerId ?? currentCompletionOwnerId();
-	const launchParentSessionId = ctx.parentSessionId ?? ctx.currentSessionId;
+	const completionOwnerProcess = currentRecordedPid();
 	try {
 		writeRetainedRequiredChildExtensions(asyncDir, params.requiredExtensions ?? ctx.childRuntime?.requiredExtensions ?? resolveRequiredChildExtensions(launchParentSessionId ?? undefined));
 	} catch (error) {
@@ -1623,6 +1644,7 @@ export function executeAsyncChain(
 				asyncDir,
 				sessionId: ctx.currentSessionId,
 				completionOwnerId: ctx.completionOwnerId ?? currentCompletionOwnerId(),
+				completionOwnerProcess,
 				...(capabilityCeiling ? { capabilityCeiling } : {}),
 				piPackageRoot,
 				childSessionFactoryModule: childSessionFactoryModule(),
@@ -1664,6 +1686,7 @@ export function executeAsyncChain(
 				runId: id,
 				...(ctx.currentSessionId ? { sessionId: ctx.currentSessionId } : {}),
 				...(initialCompletionOwnerId ? { completionOwnerId: initialCompletionOwnerId } : {}),
+				completionOwnerProcess,
 				mode: resultMode,
 				state: "running",
 				startedAt: initialStatusAt,
@@ -1882,7 +1905,7 @@ export function executeAsyncSingle(
 		if (extensionBindings !== undefined) unsupported.push("extension bindings");
 		if (unsupported.length > 0) return formatAsyncStartError("single", `Agent '${agentConfig.name}' uses runner.type='${externalRunnerType}' and does not support: ${unsupported.join(", ")}.`);
 	}
-	const capabilityCeiling = intersectSubagentCapabilityCeilings(params.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(ctx.currentSessionId), ctx.childRuntime?.capabilityCeiling);
+	const capabilityCeiling = intersectSubagentCapabilityCeilings(params.capabilityCeiling ?? resolveCurrentSubagentCapabilityCeiling(ctx.parentSessionId ?? ctx.currentSessionId), ctx.childRuntime?.capabilityCeiling);
 	try {
 		assertAgentAllowedByCapabilityCeiling(agentConfig.name, capabilityCeiling);
 	} catch (error) {
@@ -1892,6 +1915,8 @@ export function executeAsyncSingle(
 	const requestedMachine = params.machine ?? agentConfig.machine;
 	const machineUnsupported = formatHerdrMachineRunnerUnsupported({ machine: requestedMachine, agentName: agentConfig.name, runnerType: agentConfig.runner?.type, adapter: agentConfig.runner?.type === "external-cli" ? agentConfig.runner.adapter : undefined, worktree: params.worktree });
 	if (machineUnsupported) return formatAsyncStartError("single", machineUnsupported);
+	// Refuse before the runner starts; the placed launch would refuse only after the run exists.
+	if (requestedMachine && params.revivalLease) return formatAsyncStartError("single", PLACED_RESTORE_UNSUPPORTED);
 	const resolvedLauncher = resolveAgentRunnerLauncher(agentConfig, ctx.runnerLaunchers, requestedMachine);
 	if (resolvedLauncher.error) return formatAsyncStartError("single", resolvedLauncher.error);
 	const launcher = resolvedLauncher.launcher;
@@ -2092,6 +2117,7 @@ export function executeAsyncSingle(
 		runtimeSnapshotHost: ctx.pi,
 	});
 	const launchResolvedExtensions = externalRunner ? undefined : projectLaunchResolvedChildExtensions(toolPlan);
+	const parentExtensionProvider = externalRunner || machine ? undefined : parentExtensionProviderForChild(ctx, toolPlan.disableAmbientExtensions, selectedModel, availableModels, agentConfig.modelProvider ?? ctx.currentModelProvider);
 	const fast = params.fast ?? agentConfig.fast;
 	const launchThinking = resolveEffectiveThinking(selectedModel, effectiveThinking);
 	const { definitionDigest, launchContractDigest } = resolveLaunchBinding({
@@ -2185,6 +2211,7 @@ export function executeAsyncSingle(
 	let spawnResultOrPromise: SpawnRunnerResult | Promise<SpawnRunnerResult> = {};
 	const initialStatusAt = Date.now();
 	const initialCompletionOwnerId = ctx.completionOwnerId ?? currentCompletionOwnerId();
+	const completionOwnerProcess = currentRecordedPid();
 	const launchParentSessionId = ctx.parentSessionId ?? ctx.currentSessionId;
 	try {
 		spawnResultOrPromise = spawnRunner(
@@ -2213,6 +2240,7 @@ export function executeAsyncSingle(
 						...(params.fast ?? agentConfig.fast ? { fast: params.fast ?? agentConfig.fast } : {}),
 						thinking: resolveEffectiveThinking(selectedModel, effectiveThinking),
 						...(thinkingCeiling ? { thinkingCeiling } : {}),
+						...(parentExtensionProvider ? { parentExtensionProvider } : {}),
 						...(requestedModel ? { requestedModel } : {}),
 						...(modelOrigin === "inherited" ? { skipPrimaryModelVerification: true } : {}),
 						...(availableModels && availableModels.length > 0 ? { modelVerificationRegistry: availableModels } : {}),
@@ -2268,6 +2296,7 @@ export function executeAsyncSingle(
 				asyncDir,
 				sessionId: ctx.currentSessionId,
 				completionOwnerId: ctx.completionOwnerId ?? currentCompletionOwnerId(),
+				completionOwnerProcess,
 				...(capabilityCeiling ? { capabilityCeiling } : {}),
 				piPackageRoot,
 				childSessionFactoryModule: childSessionFactoryModule(),
@@ -2312,6 +2341,7 @@ export function executeAsyncSingle(
 				runId: id,
 				...(ctx.currentSessionId ? { sessionId: ctx.currentSessionId } : {}),
 				...(initialCompletionOwnerId ? { completionOwnerId: initialCompletionOwnerId } : {}),
+				completionOwnerProcess,
 				mode: "single",
 				...(params.toolCallId ? { toolCallId: params.toolCallId } : {}),
 				state: "running",

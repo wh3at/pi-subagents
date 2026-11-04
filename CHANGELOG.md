@@ -6,13 +6,126 @@
 
 - Reviewers can inspect local committed ranges with `watchdog_diff({ baseRef: "main" })` without shell access or a parent-generated artifact. Refs are pinned, the merge base is explicit, and working-tree changes, external diff/textconv programs, and lazy object fetching are excluded.
 
-- `machine: "local"` runs a native Pi child in a new background tab of your own Rex session, driven through the same bridge as a Herdr-placed Pi (prompt, steer, follow-up, abort, `contact_supervisor`, results). It fails before launch when the parent Pi is not running inside Rex, and rejects Claude Code, Codex, Cursor, and generic `external-cli` agents. A finished child keeps its tab open, with the idle Pi, until you close it; an aborted or stopped child's tab is closed, and is reported closed only after Rex confirms it is gone. See [docs/agents.md](docs/agents.md#running-a-pi-child-in-a-rex-pane-on-this-machine).
+## [0.84.0] - 2026-10-28
+
+### Highlights
+
+- Security fix: workflow scripts can no longer reach the Pi process outside their sandbox. Upgrade if you use workflow scripts.
+- A locked-down background agent that fails because one of your extensions' providers did not load in it now says which provider and how to load it.
+- Old background runs are now actually deleted from disk.
+
+### Security
+
+- Workflow scripts could reach the Pi process outside their sandbox. Upgrade to this version; see [GHSA-6v8j-6w28-2w8r](https://github.com/nicobailon/pi-subagents/security/advisories/GHSA-6v8j-6w28-2w8r) for affected versions and a workaround. Workflow scripts can no longer set `Error.prepareStackTrace`, and a script that calls `import()`, which always failed inside a workflow, is now rejected before it runs.
 
 ### Fixed
 
-- A host-required child extension (`registerRequiredChildExtensions`) is now recognized when Pi loads it under another spelling of its path, such as a symlink, a case variant, or a path with a Unicode space, so its load, provider-registration and startup failures still stop the launch. A required extension that Pi did not load at all now rejects the launch instead of letting the child start without it. Thanks to [@pandalaohe](https://github.com/pandalaohe) for #3012.
+- Old background runs are now deleted from disk. Background runs are meant to be removed 30 days after they finish, but a run was kept forever while its Pi session file still existed, and session files are never deleted, so almost no run was ever removed. A run whose session still exists is now kept for 90 days, so you can still resume it for that long, and is then removed like any other finished run. Thanks to [@LCorleone](https://github.com/LCorleone) for the report and fix, and [@isjiajia01](https://github.com/isjiajia01) for reproducing it. (#3098)
+- A background agent that loads no ambient extensions (for example one with `extensions: []`) now says so when it fails on a model whose provider one of your extensions registers or overrides. That extension never loaded in the child, so the child sent its requests through the built-in provider of the same name and failed with an unrelated provider error. The failure now names the provider and how to load its extension for that agent. Thanks to [@Yivas](https://github.com/Yivas) for the report. (#3100)
+
+## [0.83.1] - 2026-10-27
+
+### Highlights
+
+- Stopping, interrupting, or resuming a subagent can no longer act on the wrong run: an interrupt with no id is refused, and resuming a worktree child while it is still cleaning up no longer runs it in your main checkout.
+- A mission you start on purpose stays open until its result is checked, instead of showing `completed` on the writer's own report.
+- Capability limits registered by session id, as the docs show, now cover background runs and workflow children, not only foreground launches.
+- Agent files with a blank line inside an indented block are read in full, so settings below that line are no longer dropped.
+
+### Fixed
+
+- `subagent({ action: "interrupt" })` without an id is now refused with "action='interrupt' requires id.", the same as `stop`, `steer`, and `resume`. Before, it interrupted the last foreground run or the newest background run, so a call that lost its id could interrupt the wrong child. When an id matches no run, `stop`, `interrupt`, and `resume` now name that id in the error. Thanks to [@mannainsect](https://github.com/mannainsect) for the report. (#3081)
+- Resuming a background child that ran in its own worktree (`worktree: true`) no longer continues it in your main checkout. If you resumed it in the few seconds while it was saving its changes and removing its worktree, the child could start in your main checkout and commit or switch branches there, or start in a deleted worktree. That resume is now refused with a message to retry once the run finishes cleaning up. Thanks to [@peskycipher](https://github.com/peskycipher) for the report and [@isjiajia01](https://github.com/isjiajia01) for narrowing it down. (#3083)
+- A mission you start with `mission` or `missionId` no longer becomes `completed` when nothing confirmed its result. Before, a background writer run with only its own report marked its mission `completed`, so a claimed result looked like a proven one. When the run, or any workflow child in the mission, ends with acceptance `review-required`, `rejected`, `claimed`, or `pending`, the mission now stays `waiting`, and `mission.show` lists each child's acceptance status. Close it with `mission.close` after you check the result. A `gate` or `acceptance.verify` command alone does not complete a writer run's mission, because writer runs also need a review; add `review: { required: false }` to the `acceptance` policy when the command is enough ([missions.md](docs/missions.md)). Missions created automatically for ordinary launches still complete as before. Thanks to [@kiote](https://github.com/kiote). (#3078)
+- A capability ceiling registered the way the docs show, with `ctx.sessionManager.getSessionId()`, now applies in saved sessions. Before, most checks looked it up by session file path, so background launches, workflow children, and `{ action: "list" }` ignored it and only foreground launches were blocked. Every check now uses the session id, so a ceiling registered by session file path no longer applies. Thanks to [@corobis](https://github.com/corobis) for the report. (#3087)
+- A blank line inside an indented block in an agent file's frontmatter, such as an `external-cli` script argument with an empty line, cut the value off there and dropped every setting below it. The whole block is now read. Lists that used to stop at a blank line, such as `tools:`, now include their later entries, so an agent can get tools it did not get before. `|` and `>` blocks are unchanged. Thanks to [@jbachorik](https://github.com/jbachorik). (#3089)
+- A workflow script that called `runs.run({ key, agent, task })` with a single object passed validation and then failed with "runs.run has an invalid key.". Validation now rejects that call, and both the validation error and the running script show the right forms: `runs.run("plan", { agent, task })` or `runs.all([{ key, agent, task }])`. Thanks to [@brunovcosta](https://github.com/brunovcosta) for the report. (#3088)
+- In a project you have not trusted, agent lookup no longer scans the project's `.git`, `.pi`, and `.agents` folders on every call. It already ignored what was in them, but it still listed them to decide when to refresh, so ordinary git activity made it rebuild its agent list. Thanks to [@ArietidsZ](https://github.com/ArietidsZ). (#3080)
+- Long errors and verdicts in the `runs.lanes` result are now cut at a whole character, so they no longer end in a broken character or go over the 256-byte limit. Thanks to [@XLi-hub](https://github.com/XLi-hub). (#3097)
+
+## [0.83.0] - 2026-10-25
+
+### Highlights
+
+- When an extension or tool search changes the system prompt or tools during a session, subagent results no longer make every later turn miss the prompt cache, so those turns are cheaper and faster again. A child that runs its own subagents keeps its cache too.
+- Subagents that finished their work always report it: background runs no longer end as "exited with code 0 before writing a result", and foreground calls no longer hang when the child stops after its final reply.
+- Children placed on another machine (a Rex tab, Rex over SSH, or a Herdr pane) launch instead of being refused, and workflows no longer crash on Windows standalone Pi builds.
+- Extensions and editors that show subagent activity can refresh on a new event instead of polling, and `bg_wait` now waits for background jobs that other extensions report, such as surf-cli's.
+- A typo in an agent override in settings, such as `modle` or a thinking level like `hgih`, now fails with a "Did you mean" hint instead of being ignored.
+
+### Added
+
+- Extensions and editor integrations that show background subagent activity no longer need to poll for changes. A new `subagent:jobs-changed` event tells them to read `status` again whenever a background run starts, moves to its next step, reports progress, or finishes, including chain and parallel step changes that no event reported before. The RPC `ping` reply now lists it, along with the existing `subagent:async-started` event, and [extension-api.md](docs/extension-api.md#refresh-a-host-view-without-polling) shows how to use them. Thanks to [@raviy06](https://github.com/raviy06) for the proposal. (#3068)
+
+### Fixed
+
+- When an extension or tool search changed the system prompt or tools during a session, the first request of every new turn after the first subagent notice missed the prompt cache, so most of the context was sent uncached again each turn. A child that had called `subagent` missed it on every later request. On models where Pi adds those changes further down the conversation instead of rewriting the start of the prompt (Anthropic and OpenAI models, among others), the way pi-subagents marked its notices and removed parent-only subagent history made Pi move them all back into the start of the prompt, which then changed every turn. Both now leave those changes where they are. Thanks to [@adameq](https://github.com/adameq) for the report. (#3058, #3063)
+- Background subagents that finished their work no longer end as "exited with code 0 before writing a result". When a child stopped after its final reply without reporting that it had settled, or when one of its extensions hung on shutdown, the background runner process exited with the result still unwritten. It now ends the child after its final reply, waits for any compaction that runs after that reply, and waits at most 5 seconds for shutdown handlers. A foreground subagent whose child stops the same way now returns its reply too, instead of the call never returning. Thanks to [@perriea](https://github.com/perriea). (#3051)
+- Background jobs that other extensions report to `bg_wait`, such as surf-cli's or pi-agent-wait's, are now waited for in saved sessions. Before, `bg_wait` and the wait at the end of a `pi -p` run matched a job only when the extension named the session by its file path, so a job named by the session id was ignored and they returned while it was still running. Both forms are now accepted. Thanks to [@cad0p](https://github.com/cad0p) for the report. (#3071)
+- With features turned off in `disabledFeatures`, every `guide` topic now starts with a notice listing what is disabled, and every section with a one-line pointer to that list, not only the `tool-reference` topic. Before, an agent reading the workflow guide with `workflow-scripts` disabled was taught `workflow: true` and `args`, and its call was rejected. With workflow scripts disabled, the notice also says to use the top-level `tasks` or `chain` fields instead. Thanks to [@jefftheai](https://github.com/jefftheai) for the report. (#3057)
+- When text written after a tool call reaches Pi only as a summary, as happens through the Claude Agent SDK used by pi-claude-bridge, a lost ```` ```js workflow ```` block no longer means writing the script to a file first. The error now says to resend the source as `options: { script: "..." }`, which runs it directly. (#3056)
+- A fresh child placed on a machine (a Rex tab, a Rex machine over SSH, or a Herdr pane) launches. Every such launch was refused with "does not support fork, resume, or revival" because each child is handed a local session file path, which placement read as a request to restore a transcript. Builtin agents with a tools list, such as `scout`, can be placed too: their required tools are checked against the tools the remote Pi activates. Forked context is still refused on a machine, and so is a resume that would place the child again, since a placed child's transcript stays on that machine. Thanks to [@honbolau](https://github.com/honbolau) for the report and [@isjiajia01](https://github.com/isjiajia01) for tracing it. (#3043)
+- A misspelled field in a `subagents.agentOverrides` or `agentOverridesByProvider` entry, such as `modle`, was ignored; loading now fails with the settings file, the field, and the nearest known name (`Did you mean 'model'?`). An override's `thinking` must now be a known level (`off` through `max`) or `false`; a typo such as `hgih` used to be appended to the child's model id. Creating or updating an agent with the `subagent` tool now rejects such a level too, instead of writing it into the agent file. Thanks to [@isjiajia01](https://github.com/isjiajia01) for the report. (#3050)
+- Creating an agent with `thinking: off`, or updating one to ` off ` with spaces, now saves `thinking: off` in the agent file. Before, the line was left out, so the agent used the default thinking level instead of none.
+- `extensionBindings` now reach foreground children. Before, an extension in a foreground child saw no `PI_SUBAGENT_EXTENSION_BINDINGS`, or the bindings of the background child that launched it. A foreground child now gets its own bindings while its extensions load and run `session_start`, and the parent's environment is restored afterwards. Thanks to [@crisboarna](https://github.com/crisboarna). (#3049)
+- Workflows no longer crash on Windows standalone Pi builds (Bun 1.3.14) once Bun's transpiler cache is warm. The workflow worker now starts from a file in the package. Thanks to [@temoc](https://github.com/temoc). (#3055)
+- `subagent` calls from providers that send nested tool values as strings, such as `options: { capabilities: "true", timeoutMs: "120000" }`, no longer fail with "must be boolean" or "must be integer". Values inside `options` now get the same type conversion Pi already applies to top-level parameters. Thanks to [@5hiri](https://github.com/5hiri) for the report and [@isjiajia01](https://github.com/isjiajia01) for narrowing it down. (#3048)
+- Child transcripts in `/subagents-fleet`, `subagent` status and inspect replies show each tool call's input (`[tool: bash {"command":"ls"}]`) instead of only the tool name. Thanks to [@kunkun9527](https://github.com/kunkun9527) for the report. (#3053)
+
+## [0.82.1] - 2026-10-24
+
+### Highlights
+
+- A run with a damaged status file no longer hides your other runs from `/subagents-fleet` and status listings.
+- The bundled skill costs about 3k tokens per use instead of 10.6k, and agents following it block on a child less often.
+- On Opus 5.5, Sonnet 5.5 and Fable 5.1, a workflow launch that loses its script recovers on the next try instead of failing again.
+
+### Changed
+
+- The bundled `pi-subagents` skill is about a quarter of its old size: about 3k tokens per use instead of 10.6k. It keeps the common calls, the workflow and resume examples, and the rules for when and how to delegate, and points to the `guide` sections for everything else instead of copying the reference docs. In testing, agents using it blocked on a child with `async: false` 2 times in 39 tasks instead of 10. `/council` no longer loads an extra 11k-token reference.
+- On Claude 5.x models (Opus 5.5, Sonnet 5.5, Fable 5.1), text written after a tool call reaches Pi only as a short summary without code blocks, so a ```` ```js workflow ```` block written at that point is lost and `subagent({ workflow: true })` can't find it. The error now explains this and tells the agent to pass the script as a file for the rest of the turn, and the bundled skill tells these models to use a file from the start once the turn has made a tool call.
+
+### Fixed
+
+- A recent background run whose `status.json` no longer parses, for example a file filled with NUL bytes, no longer stops `/subagents-fleet` and status listings from showing your other runs. The run is skipped with one warning, shown as a notice while `/subagents-fleet` is open, which repeats only if the file changes. Its files are left as they are, and asking for that run by id still reports the parse error. Thanks to [@ozand](https://github.com/ozand) for #3040 and #3041.
+
+## [0.82.0] - 2026-10-24
+
+### Highlights
+
+- Background workflows cut off by Pi crashing, quitting or reloading resume where they stopped when you reopen their session, without running finished steps again.
+- Background runs that finished while Pi was closed report their results when you reopen their session, and a foreground run cut off by a crash can be resumed by id.
+- Pi children can run in their own Rex terminal tabs, on this Mac or on another Mac over SSH.
+- After a machine restart, runs that died with it no longer show as running or hold a capacity slot.
+- `/subagents-fleet` shows each child's task next to its agent name, so children of one run are easy to tell apart.
+
+### Added
+
+- Background workflows cut off by Pi exiting, crashing or reloading now resume on their own when you reopen or reload their session within a day, and steps that already finished are not run again. You can also resume one yourself with `subagent({ action: "resume", id })`, or set `autoResume: false` to resume them only by hand. A stopped workflow is resumed only once, and its notice says how it resumed. If you start a new Pi in the same folder instead, it tells you which session to reopen. See [docs/workflows.md](docs/workflows.md).
+- `machine: "local"` runs a native Pi child in a new background tab of your own Rex session, with the same controls as a Herdr-placed Pi child: prompts, steering, follow-ups, abort, `contact_supervisor` and results. The launch fails if the parent Pi is not running inside Rex, and Claude Code, Codex, Cursor and generic `external-cli` agents are rejected. A finished child's tab stays open until you close it; an aborted or stopped child's tab is closed. See [docs/agents.md](docs/agents.md#running-a-pi-child-in-a-rex-pane-on-this-machine).
+- A native Pi child can also run in a Rex tab on another Mac over SSH. Name the Mac in your user settings with `subagents.machines.<name>.rex.ssh`, then pass `machine: "<name>"`. The child opens in that Mac's `subagents` Rex session, which is created the first time it is needed. These machines do not need Herdr, and project settings cannot name a Rex host. See [docs/agents.md](docs/agents.md#running-a-pi-child-in-a-rex-pane-on-another-mac).
+
+### Changed
+
+- Each background child's row in `/subagents-fleet` now shows its task after the agent name, for example `worker · Fix two Cycode Python SAST findings…`, so you can tell children of one run apart without opening each one. The selected child's header still shows the run id. Thanks to [@MattDavisRV](https://github.com/MattDavisRV) for #3020.
+
+### Fixed
+
+- A background run that was still working when Pi exited or crashed never reported its result, even after you reopened its session. Its result now shows once in the reopened session: right away if the run already finished, or as soon as it finishes.
+- A foreground single run cut off by a Pi crash can now be resumed by id. It used to be recorded only when it ended, so nothing pointed to its transcript. It is now recorded when it starts, shows as `interrupted when Pi exited · resume <id>` when its session reopens, and `subagent({ action: "resume", id, message })` continues it from its transcript. Foreground runs remembered by earlier versions are not carried over and can no longer be resumed by id.
+- After Pi crashed or was killed while an async workflow ran, relaunching the same workflow ran every child again. The workflow is now marked `stopCause: "owner-exited"` when its session reopens, or when `options.reuseFrom` names it from another session, and a relaunch reuses the children that already finished, the same as after `/reload`. Its failed result says the Pi process exited. See [docs/workflows.md](docs/workflows.md).
+- A workflow relaunched more than once could start a second copy of a child that was still running, or run a finished child again. A relaunch only looked at the run it reused, and that run had no record of children still waiting for a concurrency slot when it stopped. A relaunch now looks at every earlier run in its relaunch chain and takes each child from the newest run that recorded it. Thanks to [@wireknight](https://github.com/wireknight) for the report on #3021.
+- After a machine restart, a background run or workflow that died with the machine could show as running, and hold its capacity slot, for up to a day, because its old process id could now belong to another process. On Linux and macOS, Pi now saves a boot id next to each process id and treats a process id from an earlier boot as dead. Runs started through a `launcher` are unchanged.
+- A background child awaited by an `async: false` workflow now gets an immediate `contact_supervisor` tool error when it asks a question, because its blocked parent cannot answer. The error tells it to report partial results or use an async workflow. Before, the question could wait until the run deadline and reach the parent after the child had timed out. Async workflows and children that are not awaited still get normal supervisor replies. Thanks to [@XLi-hub](https://github.com/XLi-hub) for #3028 and [@isjiajia01](https://github.com/isjiajia01) for the report in #3018.
+- Agents called `bg_wait` in a loop when it returned early because a run that was still working needed attention, such as a long `bash` command or a quiet stretch. The result now says the run is still running and that `stopOnAttention: false` waits through this, and the option's description says it still stops for supervisor requests. Thanks to [@jettoblack](https://github.com/jettoblack) for #3019.
+- A quoted name in an agent's `tools`, `excludeTools`, `mutationTools`, `extensions` or `subagentOnlyExtensions` list, such as `tools: "read", "bash"` or a `- "read"` list item, is no longer read with its quote marks. A quoted tool name made the child fail to start, and a quoted extension path pointed at a file that doesn't exist. Thanks to [@HerbertGao](https://github.com/HerbertGao) for #3017.
+- An agent whose `tools` list has a Pi `+name` or `-name` entry, such as `tools: +codemode`, now fails before launch with an error that names the agent and the entry. Before, the entry was kept as a literal tool name, so the child required a tool named `+codemode` that no child has, and adding `read` for skills, MCP tools or `structured_output` produced a list that Pi rejects. A Herdr- or Rex-placed child whose agent definition on that machine has such an entry fails the same way before its first prompt. `tools` is a complete list: name every tool the child needs, or omit `tools` and use `excludeTools` to drop one. See [docs/agents.md](docs/agents.md#tool-and-extension-selection). Thanks to [@Nyarlathoteppppp](https://github.com/Nyarlathoteppppp) for #3029.
+- A host-required child extension (`registerRequiredChildExtensions`) is now recognized when Pi loads it through another spelling of its path, such as a symlink, a different letter case, or a path with a Unicode space, so its load, provider-registration and startup failures still stop the launch. A required extension that Pi did not load at all now stops the launch instead of letting the child start without it. Thanks to [@pandalaohe](https://github.com/pandalaohe) for #3012.
+- A child agent's `MEMORY.md` that is a named pipe (FIFO) no longer stalls its launch while the prompt is built; it is skipped like any other file that is not a regular file. Thanks to [@XLi-hub](https://github.com/XLi-hub) for #3027.
 - Skill discovery no longer fails with `ENOTDIR` when a `settings.json` `packages` entry names a single extension file. Thanks to [@tara-marchand](https://github.com/tara-marchand) for #3011.
-- Herdr-placed native Pi children no longer fail their bridge configure step. The bridge read the child's active tools from the event context, which does not carry them, instead of from the Pi API, so it saw no tools and rejected every configuration.
+- Herdr-placed native Pi children no longer fail before their first prompt. The child's pane bridge looked for its active tools where Pi does not provide them, found none, and rejected every launch.
+- A corrupt saved run status or mission file no longer prints the same warning on every status refresh or retry. The warning prints once, and again only when the file or its outcome changes. The run is still skipped or retried as before, and the file is left as it is. Thanks to [@ozand](https://github.com/ozand) for #3037 and the report in #3036.
+- Updated `undici` from 8.10.2 to 8.12.3, outside the range of [GHSA-xjj6-f33q-929c](https://github.com/advisories/GHSA-xjj6-f33q-929c), so projects that install pi-subagents no longer fail `npm audit` because of it. Thanks to [@setanta00](https://github.com/setanta00) for #3022.
 
 ## [0.81.0] - 2026-10-22
 

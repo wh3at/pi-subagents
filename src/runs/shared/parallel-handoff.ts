@@ -180,20 +180,24 @@ export async function protectRetainedWorktreeForResume(manifestPath: string, run
 	}), { signal }));
 }
 
-export function resolveRetainedWorktreeCwd(manifestPath: string, runId: string, childIndex: number): string | undefined {
+export function resolveRetainedWorktreeCwd(manifestPath: string, runId: string, childIndex: number, recordedWorktreePath?: string): string | undefined {
 	const manifest = readParallelHandoffManifest(manifestPath);
-	if (!manifest) return undefined;
-	if (manifest.runId !== runId) throw new Error(`Managed worktree handoff belongs to run '${manifest.runId}', not '${runId}'.`);
-	const match = manifest.groups
+	if (manifest && manifest.runId !== runId) throw new Error(`Managed worktree handoff belongs to run '${manifest.runId}', not '${runId}'.`);
+	const match = manifest?.groups
 		.flatMap((group) => group.children.map((child) => ({ group, child })))
 		.find(({ child }) => child.index === childIndex);
-	if (!match) return undefined;
+	if (!manifest || !match) {
+		if (recordedWorktreePath) throw new Error(`Async run '${runId}' child ${childIndex} ran in managed worktree ${recordedWorktreePath}, but its handoff has no resumable record yet. Retry after the run settles; if it already ended, inspect ${manifestPath}.`);
+		return undefined;
+	}
 	const cleanup = match.group.cleanup.tasks.find((task) => task.index === match.child.taskIndex);
 	if (!cleanup) throw new Error(`Async run '${runId}' child ${childIndex} has no managed worktree cleanup record.`);
 	const relativeCwd = path.relative(resolveExistingPath(match.group.repoRoot), resolveExistingPath(manifest.cwd));
 	if (path.isAbsolute(relativeCwd) || relativeCwd === ".." || relativeCwd.startsWith(`..${path.sep}`)) throw new Error(`Async run '${runId}' has an invalid managed worktree cwd.`);
 	const requiredCwd = path.join(cleanup.path, relativeCwd);
 	if (cleanup.worktreeRemoved || cleanup.branchRemoved) throw new Error(`Async run '${runId}' required managed worktree was removed: ${requiredCwd}`);
+	// The runner removes the worktree right after this marker, without the locks that guard resume admission.
+	if (cleanup.reason?.includes("pending durable handoff capture")) throw new Error(`Async run '${runId}' child ${childIndex} is still finalizing its managed worktree: ${requiredCwd}. Retry after the run settles; if it already ended, inspect ${manifestPath}.`);
 	let worktreeRoot = "";
 	let resolvedRequiredCwd = "";
 	try {

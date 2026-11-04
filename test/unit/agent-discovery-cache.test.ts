@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { registerAgent } from "../../src/api/agents.ts";
 import { clearAgentDiscoveryCache, discoverAgentSnapshot, discoverAgents, discoverAgentsAll } from "../../src/agents/agents.ts";
@@ -53,6 +54,25 @@ describe("agent discovery snapshots", () => {
 			else process.env[name] = value;
 		}
 		fs.rmSync(tempRoot, { recursive: true, force: true });
+	});
+
+	it("does not probe ancestor project markers on cold or warm untrusted discovery", (t) => {
+		const markers = [".pi", ".agents", ".git"].map((name) => path.join(tempRoot, name));
+		for (const marker of markers) fs.mkdirSync(marker, { recursive: true });
+		fs.mkdirSync(project, { recursive: true });
+		const mutableFs = createRequire(import.meta.url)("node:fs") as typeof import("node:fs");
+		const stat = t.mock.method(mutableFs, "statSync");
+		const readdir = t.mock.method(mutableFs, "readdirSync");
+		try {
+			syncBuiltinESMExports();
+			for (let pass = 0; pass < 2; pass++) discoverAgentSnapshot(project, "both", undefined, { includeChains: false, projectTrusted: false });
+			const probed = [...stat.mock.calls, ...readdir.mock.calls].map((call) => path.resolve(String(call.arguments[0])));
+			assert.ok(probed.length > 0, "discovery reads through the spied fs");
+			assert.deepEqual(probed.filter((probe) => markers.includes(probe)), []);
+		} finally {
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+		}
 	});
 
 	it("keeps effective and all-source projections distinct in one snapshot", () => {

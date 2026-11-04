@@ -21,6 +21,7 @@ import { resolveSubagentLaunchContract } from "../../src/api/preflight.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
 import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey, getActiveAsyncCapacitySnapshot } from "../../src/runs/background/active-async-capacity.ts";
+import { primeBootId, resetBootIdForTesting } from "../../src/runs/background/boot-id.ts";
 import {
 	SUBAGENT_ASYNC_STARTED_EVENT,
 	SUBAGENT_CHILD_STATUS_EVENT,
@@ -464,11 +465,19 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 	it("persists terminal status with the result artifact", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "completed output" });
 		const id = `async-terminal-status-${Date.now().toString(36)}`;
-		launchProtocolTest(id);
-		await waitForAsyncResultFile(id);
-		const status = await waitForAsyncState(id, (candidate) => candidate.state === "complete");
-		assert.equal(status.state, "complete");
-		assert.equal(status.endedAt !== undefined, true);
+		// A value no OS reader returns: the runner's status can only carry it if it came through the runner config.
+		primeBootId("boot-id-from-parent-pi");
+		try {
+			launchProtocolTest(id);
+			assert.equal(JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, id, "status.json"), "utf-8")).bootId, "boot-id-from-parent-pi");
+			await waitForAsyncResultFile(id);
+			const status = await waitForAsyncState(id, (candidate) => candidate.state === "complete");
+			assert.equal(status.state, "complete");
+			assert.equal(status.endedAt !== undefined, true);
+			assert.equal((status as AsyncStatusPayload & { bootId?: string }).bootId, "boot-id-from-parent-pi");
+		} finally {
+			resetBootIdForTesting();
+		}
 	});
 
 	it("preserves effective thinking in the completed async result artifact", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -1302,6 +1311,19 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 				handle.dispose();
 			}
 		}
+	});
+
+	it("applies a ceiling registered by session id to async launches from a saved session", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const ctx = makeMinimalCtx(tempDir);
+		// A saved session's file path differs from its session id, which is the documented registration key.
+		ctx.sessionManager.getSessionFile = () => path.join(tempDir, "parent.jsonl");
+		const handle = registerSubagentCapabilityCeiling({ sessionId: ctx.sessionManager.getSessionId(), source: "plan-mode", ceiling: { allowedAgents: ["reviewer"] } });
+		try {
+			const launch = await makeAsyncExecutor([makeAgent("worker"), makeAgent("reviewer")]).execute("ceiling-by-id", { agent: "worker", task: "Write", async: true }, new AbortController().signal, undefined, ctx);
+			assert.equal(launch.isError, true);
+			assert.match(launch.content[0]?.text ?? "", /Capability ceiling from plan-mode does not allow agent 'worker'/);
+			assert.equal(mockPi.callCount(), 0);
+		} finally { handle.dispose(); }
 	});
 
 	it("redacts async task text from durable artifacts, transcripts, and metadata", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

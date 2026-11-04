@@ -74,6 +74,258 @@ describe("scripted workflow runtime", () => {
 		assert.deepEqual(escape.value, ["EvalError", "EvalError", "EvalError"], "args prototypes must belong to the VM realm so Function is blocked by codeGeneration.strings:false");
 	});
 
+	const realmHost = {
+		async launch(key: string) {
+			return key === "fails"
+				? { key, ok: false, output: "child failed", error: "child failed", artifactPaths: [] }
+				: { key, ok: true, output: `done ${key}`, runId: `run-${key}`, artifactPaths: [] };
+		},
+		async status(key: string) {
+			return key === "missing" ? { key, ok: false, output: "not found", artifactPaths: [] } : { key, ok: true, output: "ok", artifactPaths: [] };
+		},
+		async steer(key: string) { return { key, state: "delivered" as const }; },
+		async host(key: string) { return { key, kind: "command" as const, ok: true, state: "passed" as const, exitCode: 0, stdout: "", stderr: "", outputPath: "out.log", durationMs: 1 }; },
+		state: { get: () => ({ saved: true }), set: () => undefined },
+	};
+
+	it("blocks string compilation through every API value a workflow script receives", async () => {
+		const result = await runWorkflowScript({
+			...realmHost,
+			script: `
+				function realmOf(value) {
+					const outcomes = [() => value.constructor.constructor, () => Object.getPrototypeOf(value).constructor.constructor].map((getFunction) => {
+						try { getFunction()("return 1")(); return "worker"; } catch (error) { return error.name; }
+					});
+					return outcomes[0] === outcomes[1] ? outcomes[0] : outcomes.join("/");
+				}
+				const launched = runs.run("child", { agent: "worker", task: "t" });
+				const child = await launched;
+				const all = await runs.all([{ key: "all", agent: "worker", task: "t" }]);
+				let thrown;
+				try { runs.run(1); } catch (error) { thrown = error; }
+				const rejected = await runs.status("missing").then(() => undefined, (error) => error);
+				const nativePromise = WebAssembly.compile(new Uint8Array(0));
+				nativePromise.catch(() => undefined);
+				let customInspectorArgs;
+				console.log({ [Symbol.for("nodejs.util.inspect.custom")](depth, options, inspect) { customInspectorArgs = [options, inspect]; return "custom"; } });
+				const callSiteValues = [];
+				const captureSites = (error, sites) => { for (const site of sites) callSiteValues.push(site, site.getFunction(), site.getThis()); return "trace"; };
+				for (const ErrorClass of [Error, thrown.constructor]) { try { ErrorClass.prepareStackTrace = captureSites; } catch {} }
+				console.log(new Error("stack first read by console"));
+				void new Error("script stack").stack;
+				try { runs.run(2); } catch (error) { void error.stack; }
+				const replacedErrorSites = [];
+				const OriginalError = Error;
+				globalThis.Error = function ReplacedError() {};
+				globalThis.Error.prepareStackTrace = (error, sites) => { replacedErrorSites.push(...sites); return "trace"; };
+				void new OriginalError("stack read with a replaced Error").stack;
+				globalThis.Error = OriginalError;
+				const routes = {
+					globalThis, runs, emit, "console.log": console.log, "state.get": state.get,
+					...Object.fromEntries(Object.keys(runs).map((name) => ["runs." + name, runs[name]])),
+					Promise, "Promise.prototype": Promise.prototype, "new Promise": new Promise((resolve) => resolve(1)),
+					"runs.run promise": launched, "promise then": launched.then, "promise catch": launched.catch, "promise finally": launched.finally,
+					"runs.run result": child, "result toString": child.toString, "runs.status promise": runs.status("child"),
+					"runs.all result": all, "runs.all result map": all.map,
+					"thrown error": thrown, "rejected error": rejected, "script promise then": nativePromise.then,
+				};
+				return {
+					...Object.fromEntries(Object.entries(routes).map(([name, value]) => [name, realmOf(value)])),
+					"custom inspector": customInspectorArgs ? customInspectorArgs.map(realmOf).join("/") : "not called",
+					"stack trace hook": callSiteValues.length === 0 ? "locked" : callSiteValues.filter(Boolean).every((value) => realmOf(value) === "EvalError") ? "EvalError" : "worker",
+					"replaced Error stack hook": replacedErrorSites.flatMap((site) => [site, site.getFunction(), site.getThis()]).filter(Boolean).every((value) => realmOf(value) === "EvalError") ? "EvalError" : "worker",
+				};
+			`,
+		});
+		const value = result.value as Record<string, string>;
+		assert.deepEqual(
+			Object.entries(value).filter(([, realm]) => realm !== "EvalError"),
+			[["custom inspector", "not called"], ["stack trace hook", "locked"]],
+			"every value must come from a realm whose Function cannot compile strings",
+		);
+		assert.ok(Object.keys(value).length > 25);
+	});
+
+	it("finds no worker-realm value anywhere a workflow script can walk to", async () => {
+		const result = await runWorkflowScript({
+			...realmHost,
+			script: `
+				const seen = new Set();
+				const leaks = [];
+				function compilesStrings(value) {
+					for (const getFunction of [() => value.constructor.constructor, () => Object.getPrototypeOf(value).constructor.constructor]) {
+						let candidate;
+						try { candidate = getFunction(); } catch { continue; }
+						if (typeof candidate !== "function") continue;
+						try { candidate("return 1")(); return true; } catch {}
+					}
+					return false;
+				}
+				function sweep(path, value, depth) {
+					if (value === null || (typeof value !== "object" && typeof value !== "function") || seen.has(value)) return;
+					seen.add(value);
+					if (compilesStrings(value)) leaks.push(path);
+					if (depth === 0) return;
+					try { sweep(path + ".[[Prototype]]", Object.getPrototypeOf(value), depth - 1); } catch {}
+					let keys = [];
+					try { keys = Reflect.ownKeys(value); } catch {}
+					for (const key of keys) {
+						let descriptor;
+						try { descriptor = Object.getOwnPropertyDescriptor(value, key); } catch { continue; }
+						if (!descriptor) continue;
+						const name = path + "." + String(key);
+						sweep(name, descriptor.value, depth - 1);
+						sweep(name + "[get]", descriptor.get, depth - 1);
+						sweep(name + "[set]", descriptor.set, depth - 1);
+						sweep(name + "[descriptor]", descriptor, depth - 1);
+					}
+				}
+				const callers = [];
+				const callSites = [];
+				function probeFrames(callback) { callers.push(callback.caller); void new Error("probe").stack; }
+				Error.prepareStackTrace = (error, sites) => { for (const site of sites) callSites.push(site, site.getFunction(), site.getThis()); return "trace"; };
+				const values = {};
+				const launched = runs.run("child", { agent: "worker", task: "t" });
+				values.launched = launched;
+				values.chained = [launched.then(function onValue(value) { probeFrames(onValue); return value; }), launched.catch(() => undefined), launched.finally(() => undefined)];
+				values.child = await launched;
+				values.all = await runs.all([{ key: "all", agent: "worker", task: "t" }]);
+				values.lanes = await runs.lanes([{ key: "lane", stages: [{ key: "first", agent: "worker", task: "t" }] }]);
+				values.proxied = await runs.run("proxied", new Proxy({ agent: "worker", task: "t" }, { ownKeys: function ownKeys(target) { probeFrames(ownKeys); return Reflect.ownKeys(target); } })).then((value) => value, (error) => error);
+				values.status = await runs.status("child");
+				values.steer = await runs.steer("child", "guide");
+				values.host = await runs.host("check", { kind: "command", command: "true", timeoutMs: 1000 });
+				values.state = [await state.get("saved"), await state.set("saved", { a: 1 })];
+				values.failed = await runs.run("fails", { agent: "worker", task: "t" }).then(() => undefined, (error) => error);
+				values.missing = await runs.status("missing").then(() => undefined, (error) => error);
+				values.combinators = [Promise.resolve(1), Promise.all([launched]), Promise.allSettled([1]), Promise.race([1]), Promise.any([1]), Promise.withResolvers ? Promise.withResolvers() : null];
+				values.constructed = new Promise(function executor(resolve, reject) { probeFrames(executor); values.executorArgs = [resolve, reject]; resolve(1); });
+				await Promise.resolve({ then(resolve, reject) { values.thenableArgs = [resolve, reject]; resolve(1); } });
+				values.native = WebAssembly.compile(new Uint8Array(0));
+				values.nativeError = await values.native.then(() => undefined, (error) => error);
+				console.log(new Error("stack first read by console"));
+				values.thrown = [
+					() => runs.run(1), () => runs.all(1), () => runs.lanes(1), () => runs.ref(null), () => runs.refs(1), () => runs.host("bad key"),
+					() => runs.steer("bad key", "m"), () => state.get(1), () => state.set("k", () => 1), () => emit(() => 1), () => Promise(), () => values.all.missing,
+				].map((call) => { try { return call(); } catch (error) { return error; } });
+				const RuntimeError = values.thrown[0].constructor;
+				RuntimeError.prepareStackTrace = Error.prepareStackTrace;
+				try { runs.run(2); } catch (error) { void error.stack; }
+				RuntimeError.prepareStackTrace = undefined;
+				Error.prepareStackTrace = undefined;
+				values.callers = callers;
+				values.callSites = callSites;
+				sweep("globalThis", globalThis, 3);
+				sweep("values", values, 4);
+				return { leaks, swept: seen.size, callers: callers.length, visibleCallers: callers.filter((caller) => caller !== null).length, callSites: callSites.length };
+			`,
+		});
+		const value = result.value as { leaks: string[]; swept: number; callers: number; visibleCallers: number; callSites: number };
+		assert.deepEqual(value.leaks, []);
+		assert.ok(value.swept > 500, `sweep reached only ${value.swept} values`);
+		assert.ok(value.callers >= 3, "callbacks the runtime invokes must have been probed");
+		assert.equal(value.callSites, 0, "Error.prepareStackTrace must stay locked in both realms");
+		assert.equal(value.visibleCallers, 0, "a script callback's .caller must not expose the runtime function that invoked it");
+	});
+
+	// Engine and host internals can raise errors created outside the script realm. Whatever realm such an
+	// error comes from, the workflow runtime contract is the same: nothing reached from it compiles code.
+	const compileOutcome = `
+		function compileOutcome(getFunction) {
+			try { return getFunction()("return 1")() === 1 ? "compiled" : "blocked"; } catch { return "blocked"; }
+		}
+	`;
+
+	it("keeps a redefined locked global in the script realm", async () => {
+		const result = await runWorkflowScript({
+			...realmHost,
+			script: `${compileOutcome}
+				Object.defineProperty(globalThis, "locked", { value: 1, writable: false, configurable: false });
+				try {
+					Object.defineProperty(globalThis, "locked", { value: 2 });
+					return "no error";
+				} catch (error) {
+					return compileOutcome(() => error.constructor.constructor);
+				}
+			`,
+		});
+		assert.equal(result.value, "blocked");
+	});
+
+	it("keeps stack-limit errors in the script realm", async () => {
+		const result = await runWorkflowScript({
+			...realmHost,
+			script: `${compileOutcome}
+				const outcomes = [];
+				function recurse(atLimit) {
+					try { recurse(atLimit); } catch (overflow) {
+						if (outcomes.length < 50) {
+							try { atLimit(); } catch (error) { outcomes.push(compileOutcome(() => error.constructor.constructor)); }
+						}
+						throw overflow;
+					}
+				}
+				for (const atLimit of [() => void new Error("read near the limit").stack, () => new Promise((resolve) => resolve(1)).then((value) => value)]) {
+					try { recurse(atLimit); } catch {}
+				}
+				return { caught: outcomes.length, compiled: outcomes.filter((outcome) => outcome === "compiled").length };
+			`,
+		});
+		const value = result.value as { caught: number; compiled: number };
+		assert.ok(value.caught > 0, "reading a stack near the limit must have thrown at least once");
+		assert.equal(value.compiled, 0);
+	});
+
+	it("worker built-in constructors cannot compile code", async () => {
+		const result = await runWorkflowScript({
+			...realmHost,
+			script: `${compileOutcome}
+				const errors = [];
+				Object.defineProperty(globalThis, "locked", { value: 1, writable: false, configurable: false });
+				try { Object.defineProperty(globalThis, "locked", { value: 2 }); } catch (error) { errors.push(error); }
+				function recurse() {
+					try { recurse(); } catch (overflow) {
+						if (errors.length < 20) { try { void new Error("read near the limit").stack; } catch (error) { errors.push(error); } }
+						throw overflow;
+					}
+				}
+				try { recurse(); } catch {}
+				const sites = [];
+				const outcomes = errors.map((error) => {
+					const ErrorConstructor = error.constructor;
+					const BaseError = Object.getPrototypeOf(ErrorConstructor);
+					for (const target of [ErrorConstructor, BaseError]) {
+						try { target.prepareStackTrace = (thrown, callSites) => { sites.push(...callSites); return "trace"; }; } catch {}
+					}
+					try { void new ErrorConstructor("formatted").stack; } catch {}
+					return [
+						compileOutcome(() => ErrorConstructor.constructor),
+						compileOutcome(() => BaseError.constructor),
+						compileOutcome(() => Object.getPrototypeOf(BaseError).constructor),
+					];
+				});
+				return {
+					errors: errors.length,
+					compiled: outcomes.flat().filter((outcome) => outcome === "compiled").length,
+					frameFunctions: sites.flatMap((site) => [site, site.getFunction(), site.getThis()]).filter(Boolean).filter((value) => compileOutcome(() => value.constructor.constructor) === "compiled").length,
+				};
+			`,
+		});
+		const value = result.value as { errors: number; compiled: number; frameFunctions: number };
+		assert.ok(value.errors > 0, "the script must have caught an engine-raised error");
+		assert.equal(value.compiled, 0);
+		assert.equal(value.frameFunctions, 0);
+	});
+
+	it("rejects import() before the script runs", async () => {
+		for (const script of [`await import("node:fs");`, `return 1;\n})();\nimport("node:fs").catch(() => undefined);\n(() => {`]) {
+			await assert.rejects(
+				runWorkflowScript({ script, ...realmHost }),
+				(error: unknown) => error instanceof WorkflowScriptError && /cannot load modules with import\(\)/.test(error.message),
+			);
+		}
+	});
+
 	it("uses ordinary statement-body return semantics", async () => {
 		const implicit = await runWorkflowScript({
 			script: `({ answer: 42 });`,
@@ -150,6 +402,11 @@ describe("scripted workflow runtime", () => {
 		const invalidRunKey = validateWorkflowScript(`return runs.run("bad key", { agent: "worker" });`);
 		assert.equal(invalidRunKey.ok, false);
 		assert.ok(invalidRunKey.errors.some((error) => error.message.includes("runs.run key")));
+
+		const objectRunKey = validateWorkflowScript(`const plan = await runs.run({ key: "plan", agent: "scout", task: "x" });\nreturn plan.output;`);
+		assert.equal(objectRunKey.ok, false);
+		assert.ok(objectRunKey.errors.some((error) => error.message.includes("got an object as the first argument") && error.message.includes(`runs.run("plan", { agent, task })`)));
+		assert.equal(validateWorkflowScript(`const runs = { run: (item) => item.task };\nreturn runs.run({ task: "x" });`).ok, true);
 
 		for (const script of [
 			`return runs.run("single", { agent: "worker", task: undefined });`,
@@ -917,6 +1174,29 @@ describe("scripted workflow runtime", () => {
 				],
 			},
 		]);
+	});
+
+	it("keeps lane board text within 256 UTF-8 bytes without splitting characters", async () => {
+		for (const [input, expected] of [
+			["a".repeat(257), "a".repeat(253) + "..."],
+			["é".repeat(129), "é".repeat(126) + "..."],
+			["界".repeat(86), "界".repeat(84) + "..."],
+			["😀".repeat(65), "😀".repeat(63) + "..."],
+			["a".repeat(249) + "😀tail", "a".repeat(249) + "😀..."],
+			["界".repeat(85) + "a", "界".repeat(85) + "a"],
+		]) {
+			const result = await runWorkflowScript({
+				script: `return await runs.lanes([{ key: "lane", stages: [{ key: "check", agent: "worker", task: "check" }] }]);`,
+				async launch(key) {
+					return { key, ok: false, output: "", error: input, structuredOutput: { verdict: input }, artifactPaths: [] };
+				},
+				async status() { throw new Error("Unexpected status lookup"); },
+			});
+			const stage = (result.value as Array<{ stages: Array<{ error: string; verdict: string }> }>)[0]!.stages[0]!;
+			assert.equal(stage.error, expected);
+			assert.equal(stage.verdict, expected);
+			assert.ok(Buffer.byteLength(stage.error, "utf8") <= 256);
+		}
 	});
 
 	it("gives actionable guidance for a retained stage-0 resume", async () => {
@@ -2420,6 +2700,16 @@ describe("scripted workflow runtime", () => {
 		assert.deepEqual(result.children.map((child) => child.key), ["bad"]);
 	});
 
+	it("names the (key, params) form when runs.run gets an object", async () => {
+		const result = await runWorkflowScript({
+			script: `try { await runs.run({ key: "plan", agent: "worker", task: "x" }); } catch (e) { return e.message; }`,
+			async launch(key) { return { key, ok: true, output: "", artifactPaths: [] }; },
+			async status(key) { return { key, ok: true, output: "", artifactPaths: [] }; },
+		});
+		assert.match(String(result.value), /got an object as the first argument\. Use runs\.run\("plan", \{ agent, task \}\)/);
+		assert.deepEqual(result.children, []);
+	});
+
 	it("rejects an unawaited runs.lanes launch", async () => {
 		await assert.rejects(
 			runWorkflowScript({
@@ -2475,6 +2765,24 @@ describe("scripted workflow runtime", () => {
 					&& error.message.includes("does not support nested async functions")
 					&& error.partial.children.length === 0,
 			);
+		}
+	});
+
+	it("survives garbage collection of finished workers for portable workflow parity", async () => {
+		const bun = (globalThis as { Bun?: { gc(force: boolean): void } }).Bun;
+		for (let run = 0; run < 3; run++) {
+			const result = await runWorkflowScript({
+				script: `const child = await runs.run("gc", { agent: "worker", task: "run" }); return child.output;`,
+				timeoutMs: 5_000,
+				async launch(key) { return { key, ok: true, output: `done ${key}`, artifactPaths: [] }; },
+				async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+			});
+			assert.equal(result.value, "done gc");
+		}
+		// Bun's Worker finalizer revokes the filename whenever an eval option was passed; collecting must not throw.
+		for (let pass = 0; pass < 5; pass++) {
+			bun?.gc(true);
+			await new Promise((resolve) => setTimeout(resolve, 50));
 		}
 	});
 
