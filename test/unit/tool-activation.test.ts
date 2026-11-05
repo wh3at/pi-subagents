@@ -10,13 +10,16 @@ import registerSubagentExtension from "../../src/extension/index.ts";
 import { PI_CODING_AGENT_PACKAGE_ROOT_ENV } from "../../src/shared/utils.ts";
 import { resolvePiPackageRoot } from "../../src/runs/shared/pi-spawn.ts";
 import { registerBackgroundWorkProvider } from "../../src/api/background-work.ts";
+import { DEFAULT_WAIT_TOOL_NAME, setWaitToolName } from "../../src/shared/wait-tool-name.ts";
+import { SubagentWaitParams } from "../../src/extension/schemas.ts";
 
 type Handler = (event: any, context: any) => any;
 type Tool = { name: string; description?: string; promptSnippet?: string; parameters?: unknown; execute?: (...args: any[]) => any; sourceInfo?: { path: string } };
 
 const runtimes: Array<{ handlers: Map<string, Handler[]>; context: any }> = [];
 
-type RuntimeOptions = { config?: Record<string, unknown>; model?: unknown };
+// `branch`: the session's full message history, which getBranch returns; it defaults to the compacted context's messages.
+type RuntimeOptions = { config?: Record<string, unknown>; model?: unknown; branch?: any[] };
 const DYNAMIC: RuntimeOptions = { config: { toolActivation: "dynamic" } };
 
 function createRuntime(messages: any[] = [], excluded: string[] = [], missingApis: string[] = [], options: RuntimeOptions = {}) {
@@ -55,6 +58,7 @@ function createRuntime(messages: any[] = [], excluded: string[] = [], missingApi
 		sessionManager: {
 			getSessionId() { return "activation-session"; }, getSessionFile() { return null; }, getEntries() { return []; },
 			buildSessionContext() { return { messages }; },
+			getBranch() { return (options.branch ?? messages).map((message) => message.role === "compactionSummary" ? { type: "compaction" } : { type: "message", message }); },
 		},
 		modelRegistry: { getAvailable() { return []; } },
 	};
@@ -356,6 +360,32 @@ describe("toolActivation modes", () => {
 		}
 	});
 
+	it("keeps a wait tool recorded as bg_wait selected after waitTool.name renames it", async () => {
+		const renamed = { config: { waitTool: { name: "subagent_wait" } }, model: COMPATIBLE };
+		const reopen = async (messages: any[]) => {
+			const runtime = createRuntime(messages, [], [], renamed);
+			runtime.select(["read", "subagent", "contact_supervisor"]);
+			await runtime.emit("session_start", RESUME);
+			return runtime.active();
+		};
+		// The transcript keeps each tool's full definition, so a bg_wait record says whose bg_wait it was.
+		const withWait = (parameters: unknown) => {
+			const message = declared(["read", "subagent", "contact_supervisor"]);
+			return { ...message, toolsAdded: [...message.toolsAdded, { name: "bg_wait", description: "wait", parameters }] };
+		};
+		const otherExtensionWait = { type: "object", properties: { id: { type: "string" }, timeout: { type: "number" } } };
+		try {
+			const before = [withWait(SubagentWaitParams)];
+			assert.ok((await reopen(before)).includes("subagent_wait"), "recorded before the rename");
+			assert.equal((await reopen([withWait(otherExtensionWait)])).includes("subagent_wait"), false, "another extension's bg_wait");
+			assert.equal((await reopen([...before, withWait(otherExtensionWait)])).includes("subagent_wait"), false, "another extension's bg_wait declared later");
+			assert.equal((await reopen([...before, declared([], ["bg_wait"])])).includes("subagent_wait"), false, "removed before the rename");
+			assert.equal((await reopen([...before, declared([], ["subagent_wait"])])).includes("subagent_wait"), false, "removed after the rename");
+		} finally {
+			setWaitToolName(DEFAULT_WAIT_TOOL_NAME);
+		}
+	});
+
 	it("brings back the extension's tools an unload left off when a new process restores the transcript", async () => {
 		const extensionTools = ["subagent", "contact_supervisor", "bg_wait", "subagent_supervisor"];
 		// A new process (`pi --continue`) starts with the transcript's tools, which the unload left without this extension's.
@@ -443,6 +473,20 @@ describe("toolActivation modes", () => {
 		}
 		await replayAll([declared(["read", "subagents_enable"]), compacted, declared(["bg_wait"])], { model: COMPATIBLE }, ["subagents_enable", "bg_wait"], "checkpointed cold",
 			{ subagents_enable: true, subagent: false, bg_wait: true });
+	});
+
+	it("keeps the selection from before an extension unload that a compaction checkpoint folded away", async () => {
+		const enabled = ["subagent", "contact_supervisor", "bg_wait", "subagent_supervisor"];
+		// The checkpoint declares the tools active when the compaction ran, which the unload had left off.
+		const checkpointed = [declared(["read"]), compacted];
+		for (const caseModel of [COMPATIBLE, INCOMPATIBLE]) {
+			await replayAll(checkpointed, { model: caseModel, branch: [declared(["read", ...enabled]), declared([], enabled), compacted] }, [], "warm unload",
+				{ subagents_enable: false, subagent: true, contact_supervisor: true, bg_wait: true, subagent_supervisor: true });
+			await replayAll(checkpointed, { model: caseModel, branch: [declared(["read", "subagents_enable"]), declared([], ["subagents_enable"]), compacted] }, [], "cold unload",
+				{ subagents_enable: true, subagent: false });
+			await replayAll([declared(["read", "bg_wait", "subagent_supervisor"]), compacted], { model: caseModel, branch: [declared(["read", ...enabled]), declared([], ["subagent", "contact_supervisor"]), compacted] }, ["bg_wait", "subagent_supervisor"], "deliberate removal",
+				{ subagents_enable: false, subagent: false });
+		}
 	});
 
 	it("keeps the loader of a lost activation state across an unload recorded after the compaction", async () => {

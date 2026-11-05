@@ -157,6 +157,7 @@ import { HerdrExternalNeedsAttentionError, createHerdrExternalAdapter, prepareIn
 import { runExternalJob } from "../shared/external-job-runner.ts";
 import { createOrcaProgressTab, type OrcaProgressTab } from "../shared/orca-progress-tabs.ts";
 import type { ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
+import { setWaitToolName } from "../../shared/wait-tool-name.ts";
 import {
 	acceptChildWatchdogEvent,
 	applyChildWatchdogMessage,
@@ -225,9 +226,10 @@ export interface SubagentRunConfig {
 	revivalLeaseToken?: string;
 	/** Global cap on simultaneously-running subagent tasks within this run. */
 	globalConcurrencyLimit?: number;
+	/** The parent's config.waitTool.name, when not bg_wait; this process and its children use it. */
+	waitToolName?: string;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	runFanoutBudget?: RunFanoutBudgetDescriptor;
-	/** Builtin tool names the host runtime provides; used to intersect agent-declared tools. */
 	launchContractDigest?: string;
 	launchResolvedExtensions?: LaunchResolvedChildExtensions;
 	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensions;
@@ -273,7 +275,6 @@ interface StepResult {
 	nativeMachine?: import("../../shared/types.ts").SingleResult["nativeMachine"];
 	thinking?: string;
 	requestedModel?: string;
-	/** True when the dispatch failed because the input exceeded the model's context window. */
 	contextOverflow?: boolean;
 	totalCost?: CostSummary;
 	artifactPaths?: ArtifactPaths;
@@ -663,7 +664,6 @@ async function readGitFingerprint(cwd: string, signal: AbortSignal, onError: (er
 	}
 }
 
-/** Context for running a single step */
 interface SingleStepContext {
 	previousOutput: string;
 	outputs?: ChainOutputMap;
@@ -679,7 +679,6 @@ interface SingleStepContext {
 	outputFile: string;
 	transcriptPath?: string;
 	piPackageRoot?: string;
-	/** Factory the runner creates this step's child session through. */
 	childSessions: ChildSessionFactory;
 	/** The launching executor's own child runtime; nested route, depth, and ceilings come from here. */
 	inheritedChildRuntime?: InheritedChildRuntime;
@@ -1074,7 +1073,8 @@ export async function runSingleStepInner(
 	}
 
 	const effectiveCwd = step.cwd ?? ctx.cwd;
-	const cwdError = preflightLaunchCwd(step.requestedCwd ?? effectiveCwd, effectiveCwd);
+	// A placed child's cwd is a directory on its machine; only machine 'local' shares this disk.
+	const cwdError = step.machine && !isRexLocalMachine(step.machine) ? undefined : preflightLaunchCwd(step.requestedCwd ?? effectiveCwd, effectiveCwd);
 	if (cwdError) return { agent: step.agent, output: cwdError, error: cwdError, exitCode: 1, context: step.context };
 	if (step.context === "fork" && step.sessionFile && fs.existsSync(step.sessionFile)) {
 		alignForkedSessionCwd(step.sessionFile, effectiveCwd);
@@ -1094,7 +1094,7 @@ export async function runSingleStepInner(
 	let actualLaunchContractDigest = step.launchContractDigest;
 	// A machine 'local' child edits this disk, so its local Git evidence is authoritative, as for an unplaced run.
 	const mutationSnapshot = step.machine && !isRexLocalMachine(step.machine) ? { source: "tracked-files" as const, trackedOnly: true as const, cwd: step.cwd ?? ctx.cwd, dirtyFiles: [], fingerprints: {}, unavailable: "Local Git evidence is not authoritative for a pane-native remote run." } : snapshotTrackedMutations(step.cwd ?? ctx.cwd);
-	let finalMutationEvidence = collectTrackedMutationEvidence(mutationSnapshot, step.cwd ?? ctx.cwd);
+	let finalMutationEvidence = await collectTrackedMutationEvidence(mutationSnapshot, step.cwd ?? ctx.cwd);
 
 	let contextOverflow = false;
 	let launchWarningsEmitted = false;
@@ -1310,7 +1310,7 @@ export async function runSingleStepInner(
 			? formatEmptyTerminalAssistantResponseError(run.messages)
 			: undefined;
 		const remoteGitChanged = run.nativeMachine?.initialGit && run.nativeMachine.finalGit ? run.nativeMachine.initialGit.head !== run.nativeMachine.finalGit.head || run.nativeMachine.initialGit.dirty !== run.nativeMachine.finalGit.dirty : undefined;
-		const mutationEvidence = run.nativeMachine && !isRexLocalMachine(step.machine) ? { source: "tracked-files" as const, trackedOnly: true as const, changedFiles: [], attemptedMutation: remoteGitChanged === true, ...(remoteGitChanged === undefined ? { unavailable: "Remote Git before/after evidence was incomplete." } : {}) } : collectTrackedMutationEvidence(mutationSnapshot, step.cwd ?? ctx.cwd);
+		const mutationEvidence = run.nativeMachine && !isRexLocalMachine(step.machine) ? { source: "tracked-files" as const, trackedOnly: true as const, changedFiles: [], attemptedMutation: remoteGitChanged === true, ...(remoteGitChanged === undefined ? { unavailable: "Remote Git before/after evidence was incomplete." } : {}) } : await collectTrackedMutationEvidence(mutationSnapshot, step.cwd ?? ctx.cwd);
 		finalMutationEvidence = mutationEvidence;
 		const mutationAttemptObserved = run.observedMutationAttempt === true || mutationEvidence.attemptedMutation === true;
 		// Validated structured output is persistable file content even when the final text is only
@@ -1597,9 +1597,9 @@ type RunnerStatusStep = NonNullable<AsyncStatus["steps"]>[number] & {
 	description?: string;
 };
 
-function externalRunnerStatus(runner: SubagentStep["runner"]): ExternalCliRunnerStatus | ExternalJobRunnerStatus | undefined {
+function externalRunnerStatus(runner: SubagentStep["runner"], machine: SubagentStep["machine"]): ExternalCliRunnerStatus | ExternalJobRunnerStatus | undefined {
 	if (runner?.type === "external-cli") {
-		return resolveExternalCliRunnerStatus(runner);
+		return resolveExternalCliRunnerStatus(machine?.provider === "herdr" ? { ...runner, machine } : runner);
 	}
 	if (runner?.type === "external-job") {
 		return {
@@ -1892,6 +1892,7 @@ export async function runSubagent(
 ): Promise<void> {
 	const { id, steps, resultPath, cwd, placeholder, taskIndex, totalTasks, maxOutput, artifactsDir, artifactConfig } =
 		config;
+	if (config.waitToolName) setWaitToolName(config.waitToolName);
 	const globalSemaphore = new Semaphore(config.globalConcurrencyLimit ?? DEFAULT_GLOBAL_CONCURRENCY_LIMIT);
 	let previousOutput = "";
 	const outputs: ChainOutputMap = {};
@@ -1948,7 +1949,7 @@ export async function runSubagent(
 					agent: task.agent,
 					...(task.lane ? { lane: task.lane } : config.lane ? { lane: config.lane } : {}),
 					...(taskSessionName ? { sessionName: taskSessionName } : {}),
-					...(externalRunnerStatus(task.runner) ? { runner: externalRunnerStatus(task.runner) } : {}),
+					...(externalRunnerStatus(task.runner, task.machine) ? { runner: externalRunnerStatus(task.runner, task.machine) } : {}),
 					...(statusStepDescription(task.task) ? { description: statusStepDescription(task.task) } : {}),
 					...(task.context ? { context: task.context } : {}),
 					phase: task.phase,
@@ -1978,7 +1979,7 @@ export async function runSubagent(
 			parallelGroups.push({ start: flatStepCount, count: 1, stepIndex });
 			initialStatusSteps.push(omitUndefinedProperties({
 				agent: `expand:${step.parallel.agent}`,
-				...(externalRunnerStatus(step.parallel.runner) ? { runner: externalRunnerStatus(step.parallel.runner) } : {}),
+				...(externalRunnerStatus(step.parallel.runner, step.parallel.machine) ? { runner: externalRunnerStatus(step.parallel.runner, step.parallel.machine) } : {}),
 				...(step.parallel.context ? { context: step.parallel.context } : {}),
 				phase: step.phase ?? step.parallel.phase,
 				label: step.label ?? step.parallel.label ?? `Dynamic fanout (${step.collect.as})`,
@@ -2002,7 +2003,7 @@ export async function runSubagent(
 				agent: step.agent,
 				...(step.lane ? { lane: step.lane } : config.lane ? { lane: config.lane } : {}),
 				...(stepSessionName ? { sessionName: stepSessionName } : {}),
-				...(externalRunnerStatus(step.runner) ? { runner: externalRunnerStatus(step.runner) } : {}),
+				...(externalRunnerStatus(step.runner, step.machine) ? { runner: externalRunnerStatus(step.runner, step.machine) } : {}),
 				...(statusStepDescription(step.task) ? { description: statusStepDescription(step.task) } : {}),
 				...(step.context ? { context: step.context } : {}),
 				phase: step.phase,
@@ -3008,7 +3009,7 @@ export async function runSubagent(
 		statusPayload.lastUpdate = now;
 		writeStatusPayload();
 	};
-	// Records a finished child's result on its status step; the sequential and both parallel paths share it.
+	// The sequential and both parallel paths share it.
 	const recordStepResult = (fi: number, singleResult: StepResult, startedAt: number, endedAt: number, recordLaunchContractDigest = false): void => {
 		const step = requiredStatusStep(statusPayload, fi);
 		const childStopped = singleResult.stopped === true;
@@ -3052,7 +3053,6 @@ export async function runSubagent(
 		if (singleResult.capabilityCeiling) statusPayload.capabilityCeiling = singleResult.capabilityCeiling;
 		if (singleResult.capabilityAudit) statusPayload.capabilityAudit = singleResult.capabilityAudit;
 	};
-	// Adds a parallel child's cost to the in-flight usage ledger.
 	const addParallelUsageCost = (totalCost: StepResult["totalCost"]): void => {
 		if (!totalCost) return;
 		pendingParallelUsageCost = {
@@ -3689,7 +3689,7 @@ export async function runSubagent(
 					? path.join(path.dirname(step.parallel.outputPath), `dynamic-${stepIndex}`, `${itemIndex}-${step.parallel.agent}`, path.basename(step.parallel.outputPath))
 					: step.parallel.outputPath;
 				const taskText = task.task ?? step.parallel.task;
-				const materializedTask = step.parallel.namespaceOutputPath ? injectSingleOutputInstruction(taskText, outputPath, step.parallel) : taskText;
+				const materializedTask = step.parallel.namespaceOutputPath ? injectSingleOutputInstruction(taskText, outputPath, step.parallel, step.parallel.machine) : taskText;
 				const sessionName = deriveChildSessionName({ agent: step.parallel.agent, task: taskText, label: task.label ?? step.parallel.label });
 				return omitUndefinedProperties({
 					...step.parallel,
@@ -3722,7 +3722,7 @@ export async function runSubagent(
 				return omitUndefinedProperties({
 					agent: task.agent,
 					...(task.sessionName ? { sessionName: task.sessionName } : {}),
-					...(externalRunnerStatus(task.runner) ? { runner: externalRunnerStatus(task.runner) } : {}),
+					...(externalRunnerStatus(task.runner, task.machine) ? { runner: externalRunnerStatus(task.runner, task.machine) } : {}),
 					...(statusStepDescription(task.task) ? { description: statusStepDescription(task.task) } : {}),
 					...(task.context ? { context: task.context } : {}),
 					...(task.phase ?? step.phase ? { phase: task.phase ?? step.phase } : {}),

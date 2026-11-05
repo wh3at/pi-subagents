@@ -110,4 +110,41 @@ describe("resolveGlobalNpmRoot", () => {
 		assert.equal(completed, false, "the lookup should still be in flight");
 		assert.equal(await lookup, await fs.promises.realpath(root));
 	});
+	it("does not launch npm when already cancelled", async () => {
+		const { dir, env } = fixture("exit 1");
+		const marker = path.join(dir, "called");
+		const executable = path.join(dir, "bin", process.platform === "win32" ? "npm.cmd" : "npm");
+		fs.writeFileSync(executable, process.platform === "win32" ? `@echo off\r\necho called > "${marker}"\r\n` : `#!/bin/sh\necho called > '${marker}'\n`, { mode: 0o755 });
+		assert.equal(await resolveGlobalNpmRoot({ env, signal: AbortSignal.abort() }), null);
+		assert.equal(fs.existsSync(marker), false);
+	});
+
+	it("cancels a pending lookup and terminates its owned POSIX process", async () => {
+		if (process.platform === "win32") return; // npm.cmd descendants are outside this ownership assertion.
+		const { dir, env } = fixture("exit 1");
+		const pidFile = path.join(dir, "npm.pid");
+		fs.writeFileSync(path.join(dir, "bin", "npm"), `#!/bin/sh\necho $$ > '${pidFile}'\nexec sleep 30\n`, { mode: 0o755 });
+		const controller = new AbortController();
+		const lookup = resolveGlobalNpmRoot({ env, timeoutMs: 5000, signal: controller.signal });
+		try {
+			const deadline = Date.now() + 3000;
+			let pid: number | undefined;
+			while (Date.now() < deadline) {
+				const receipt = fs.existsSync(pidFile) ? fs.readFileSync(pidFile, "utf8") : "";
+				if (/^\d+\n$/.test(receipt)) {
+					pid = Number(receipt);
+					break;
+				}
+				await new Promise(resolve => setTimeout(resolve, 10));
+			}
+			assert.ok(pid !== undefined, "owned npm must publish its PID");
+			controller.abort();
+			assert.equal(await lookup, null);
+			for (let waited = 0; waited < 3000; waited += 20) {
+				try { process.kill(pid, 0); } catch { break; }
+				await new Promise(resolve => setTimeout(resolve, 20));
+			}
+			assert.throws(() => process.kill(pid, 0), { code: "ESRCH" }, `cancelled owned npm ${pid} must exit`);
+		} finally { controller.abort(); await lookup; }
+	});
 });

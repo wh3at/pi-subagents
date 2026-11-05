@@ -3,7 +3,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { safeTerminalText } from "../../shared/display-text.ts";
 import { getArtifactPaths, getArtifactsDir } from "../../shared/artifacts.ts";
-import { readFleetTranscript } from "../../tui/fleet-transcript.ts";
+import { readFleetTranscript } from "../../shared/fleet-transcript-reader.ts";
 import { formatAsyncRunList, formatAsyncRunOutputPath, formatAsyncRunProgressLabel, formatWorkflowStageLine, listAsyncRuns } from "./async-status.ts";
 import { formatAsyncResultTranscript, formatAsyncRunTranscript, formatNestedRunTranscript, inspectSubagentFleet } from "./fleet-view.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
@@ -38,6 +38,7 @@ import { formatWorkflowKeyRevival, projectWorkflowKeyRevival } from "../../workf
 import { capSummaryOutputs } from "../shared/single-output.ts";
 import { ownsRun } from "../shared/run-ownership.ts";
 import { foregroundChildStateLabel } from "../foreground/foreground-history.ts";
+import { waitToolName } from "../../shared/wait-tool-name.ts";
 
 /** A step whose structured output has a path line needs only a short inline preview. */
 const STRUCTURED_PREVIEW_WITH_PATH_CHARS = 500;
@@ -144,7 +145,7 @@ function formatResumeGuidance(runId: string | undefined, children: Array<{ agent
 	const resumableWorkflowChildren = workflowChildren.filter(({ child }) => !(child.status === "paused" && child.activityState === "needs_attention"));
 	if (workflowChildren.length > 0) {
 		return [
-			...supervisorDetachedWorkflowChildren.map(({ child }) => `Recovery workflow child${typeof child.workflowKey === "string" && child.workflowKey.trim() ? ` '${child.workflowKey}'` : ""}: reply to the supervisor request first, then wait with bg_wait({ id: "${child.runId}" }). Use subagent({ action: "status", id: "${child.runId}" }) to recover the result; do not resume or launch a replacement while it remains detached.`),
+			...supervisorDetachedWorkflowChildren.map(({ child }) => `Recovery workflow child${typeof child.workflowKey === "string" && child.workflowKey.trim() ? ` '${child.workflowKey}'` : ""}: reply to the supervisor request first, then wait with ${waitToolName()}({ id: "${child.runId}" }). Use subagent({ action: "status", id: "${child.runId}" }) to recover the result; do not resume or launch a replacement while it remains detached.`),
 			...resumableWorkflowChildren.map(({ child }) => `Revive workflow child${typeof child.workflowKey === "string" && child.workflowKey.trim() ? ` '${child.workflowKey}'` : ""}: subagent({ action: "resume", id: "${child.runId}", message: "..." })`),
 		].join("\n");
 	}
@@ -244,7 +245,7 @@ function formatRememberedForegroundStatus(run: ForegroundResumeRun): string {
 	const detached = run.children.some((child) => child.status === "detached");
 	const resumable = run.children.find((child) => hasExistingSessionFile(child.sessionFile));
 	if (detached) {
-		lines.push(`Recovery: reply to the supervisor request first, then wait with bg_wait({ id: "${run.runId}" }); do not resume or launch a replacement while any child remains detached.`);
+		lines.push(`Recovery: reply to the supervisor request first, then wait with ${waitToolName()}({ id: "${run.runId}" }); do not resume or launch a replacement while any child remains detached.`);
 	} else if (resumable) {
 		lines.push(run.children.length === 1
 			? `Revive: subagent({ action: "resume", id: "${run.runId}", message: "..." })`
@@ -661,10 +662,11 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 						lines.push(`  Runner: external-cli (${runner.command}${runner.args.length ? ` ${runner.args.join(" ")}` : ""})`);
 						lines.push(`  Adapter: ${runner.adapter.id} v${runner.adapter.version} (${runner.adapter.executionMode})`);
 						if (runner.safety) {
-							if ("approvalPolicy" in runner.safety) lines.push(`  Safety: ${"access" in runner.safety ? `access=${runner.safety.access}, ` : ""}sandbox=${runner.safety.sandbox}, approval=${runner.safety.approvalPolicy}, ephemeral=${runner.safety.ephemeral}`);
-							else if ("mode" in runner.safety) lines.push(`  Safety: access=${runner.safety.access}, auth=${runner.safety.authentication}, mode=${runner.safety.mode}, sandbox=${runner.safety.sandbox}, workspaceTrust=${runner.safety.workspaceTrust}, sessionReuse=${runner.safety.sessionReuse}`);
-							else if ("authentication" in runner.safety) lines.push(`  Safety: access=${runner.safety.access}, auth=${runner.safety.authentication}, permission=${runner.safety.permissionMode}, tools=${runner.safety.tools}, mcp=${runner.safety.mcp}, settings=${runner.safety.settingSources}, settingsTrust=${runner.safety.userSettingsTrust}, persistence=${runner.safety.sessionPersistence}`);
-							else lines.push(`  Safety: access=read-only, permission=${runner.safety.permissionMode}, tools=${runner.safety.tools}, mcp=${runner.safety.mcp}, settings=${runner.safety.settingSources}, persistence=${runner.safety.sessionPersistence}`);
+							const safetyLabel = "  Safety (adapter profile, not measured):";
+							if ("approvalPolicy" in runner.safety) lines.push(`${safetyLabel} ${"access" in runner.safety ? `access=${runner.safety.access}, ` : ""}sandbox=${runner.safety.sandbox}, approval=${runner.safety.approvalPolicy}, ephemeral=${runner.safety.ephemeral}`);
+							else if ("mode" in runner.safety) lines.push(`${safetyLabel} access=${runner.safety.access}, auth=${runner.safety.authentication}, mode=${runner.safety.mode}, sandbox=${runner.safety.sandbox}, workspaceTrust=${runner.safety.workspaceTrust}, sessionReuse=${runner.safety.sessionReuse}`);
+							else if ("authentication" in runner.safety) lines.push(`${safetyLabel} access=${runner.safety.access}, auth=${runner.safety.authentication}, permission=${runner.safety.permissionMode}, tools=${runner.safety.tools}, mcp=${runner.safety.mcp}, settings=${runner.safety.settingSources}, settingsTrust=${runner.safety.userSettingsTrust}, persistence=${runner.safety.sessionPersistence}`);
+							else lines.push(`${safetyLabel} access=read-only, permission=${runner.safety.permissionMode}, tools=${runner.safety.tools}, mcp=${runner.safety.mcp}, settings=${runner.safety.settingSources}, persistence=${runner.safety.sessionPersistence}`);
 						}
 						lines.push(`  Capabilities: stop=${runner.capabilities.stop}, steer=false, resume=false, structuredOutput=false, toolEvents=false, supervisor=unsupported, forkContext=false, extensionBindings=false`);
 						lines.push(`  Unsupported steer: ${runner.unsupportedReasons.steer}`);

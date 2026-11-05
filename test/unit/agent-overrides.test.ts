@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
+import { handleManagementAction } from "../../src/agents/agent-management.ts";
 import { buildBuiltinOverrideConfig, discoverAgents, discoverAgentsAll, removeBuiltinAgentOverride, saveBuiltinAgentOverride } from "../../src/agents/agents.ts";
 
 let tempHome = "";
@@ -27,6 +28,13 @@ function writeUserAgent(home: string, name: string, body: string): void {
 	const filePath = path.join(home, ".pi", "agent", "agents", `${name}.md`);
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
 	fs.writeFileSync(filePath, body, "utf-8");
+}
+
+function modelsText(cwd: string, agent: string): string {
+	const result = handleManagementAction("models", { agent }, { cwd, modelRegistry: { getAvailable: () => [] } });
+	const first = result.content[0];
+	assert.ok(first?.type === "text");
+	return first.text.replaceAll("\\", "/");
 }
 
 describe("builtin agent overrides", () => {
@@ -602,6 +610,26 @@ describe("builtin agent overrides", () => {
 		assert.equal(reviewer.override?.path, path.join(tempProject, ".pi", "settings.json"));
 	});
 
+	it("layers a project override on top of a user override for a builtin agent instead of discarding it", () => {
+		fs.mkdirSync(path.join(tempProject, ".pi"), { recursive: true });
+		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
+			subagents: { agentOverrides: { scout: { model: "openrouter/user-model", description: "User description" } } },
+		});
+		writeJson(path.join(tempProject, ".pi", "settings.json"), {
+			subagents: { agentOverrides: { scout: { thinking: "high", description: "Project description" } } },
+		});
+
+		const scout = discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "scout");
+		assert.ok(scout);
+		assert.equal(scout.model, "openrouter/user-model");
+		assert.equal(scout.thinking, "high");
+		assert.equal(scout.description, "Project description");
+		assert.equal(scout.override?.scope, "project");
+		const models = modelsText(tempProject, "scout");
+		assert.match(models, /Source: user override/);
+		assert.match(models, /Override file:\n  .*\/\.pi\/agent\/settings\.json\n/);
+	});
+
 	it("layers active-provider overrides over default agentOverrides", () => {
 		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
 			subagents: {
@@ -677,9 +705,7 @@ describe("builtin agent overrides", () => {
 		// file with no model/thinking in frontmatter) that gets its
 		// model pin exclusively from a *user*-scope agentOverrides entry must keep
 		// that pin when a *project*-scope override adds an unrelated field (here:
-		// subagentOnlyExtensions). Previously the project override for this agent
-		// name replaced the user override wholesale, silently dropping model /
-		// thinking with no error.
+		// subagentOnlyExtensions).
 		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
 			subagents: {
 				agentOverrides: {
@@ -708,17 +734,10 @@ describe("builtin agent overrides", () => {
 		assert.equal(reviewer.thinking, "high");
 		assert.deepEqual(reviewer.subagentOnlyExtensions, ["./tools/child-only.ts"]);
 		assert.equal(reviewer.override?.scope, "project");
+		assert.match(modelsText(tempProject, "persona-reviewer"), /Source: user override/);
 	});
 
 	it("lets a project override flip `disabled` on a custom agent even after a user override already set it", () => {
-		// Regression test for a bug caught in review of the layering fix above:
-		// applyCustomAgentOverride's `disabled` handling used a stray
-		// `agent.disabled === undefined` guard (a no-op before layering existed,
-		// since this function only ever ran once against the pristine base
-		// agent). Once user-then-project layering was introduced, that guard
-		// silently blocked the project override from ever changing `disabled`
-		// once the user override had already set it — breaking this PR's own
-		// "project wins" precedence for that one field. Cover both directions.
 		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
 			subagents: {
 				agentOverrides: {

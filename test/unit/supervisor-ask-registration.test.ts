@@ -60,8 +60,7 @@ function makeCtx(sessionId: string, sessionFile: string | null = null): { cwd: s
 
 /**
  * Write an ask directly to the channel the way a child's `contact_supervisor` call does, without
- * going through a live poller. This is the state the wave-11 incident was in: the request file was
- * on disk and no scan had happened yet.
+ * going through a live poller.
  */
 function writeRequest(input: { sessionId: string; runId: string; agent?: string; index?: number; message?: string; reason?: "need_decision" | "progress_update"; expiresAt?: number }): string {
 	const agent = input.agent ?? "worker";
@@ -849,8 +848,9 @@ describe("supervisor ask registration", () => {
 		try {
 			channel.start();
 			const tool = tools.get(NATIVE_SUPERVISOR_TOOL_NAME)!;
-			const expired = writeRequest({ sessionId, runId, expiresAt: Date.now() - 1 });
-			await assert.rejects(tool.execute("expired", { action: "reply", replyTo: expired, message: "Too late" }), /No pending supervisor request found.*No pending supervisor requests\./);
+			const expiredAt = Date.now() - 1;
+			const expired = writeRequest({ sessionId, runId, expiresAt: expiredAt });
+			await assert.rejects(tool.execute("expired", { action: "reply", replyTo: expired, message: "Too late" }), new RegExp(`Supervisor request '${expired}' .* expired at ${new Date(expiredAt).toISOString()}: .*No pending supervisor requests\\.`));
 			const missing = writeRequest({ sessionId, runId });
 			const resolved = writeRequest({ sessionId, runId });
 			await tool.execute("pending", { action: "pending" });
@@ -859,12 +859,19 @@ describe("supervisor ask registration", () => {
 			fs.rmSync(path.join(dir, "requests", `${missing}.json`));
 			const replyFile = path.join(dir, "replies", `${resolved}.json`);
 			fs.writeFileSync(replyFile, JSON.stringify({ message: "Already answered" }));
-			for (const replyTo of [missing, resolved]) {
-				await assert.rejects(tool.execute("stale", { action: "reply", replyTo, message: "Must not overwrite" }), /No pending supervisor request found/);
-			}
+			await assert.rejects(tool.execute("stale", { action: "reply", replyTo: missing, message: "Must not overwrite" }), new RegExp(`Supervisor request '${missing}' .* was withdrawn by the child before its ask deadline \\(noticed at `));
+			await assert.rejects(tool.execute("stale", { action: "reply", replyTo: resolved, message: "Must not overwrite" }), new RegExp(`Supervisor request '${resolved}' .* was already answered \\(noticed at `));
 			assert.equal(channel.pending.size, 0);
 			assert.deepEqual(fs.readdirSync(path.join(dir, "replies")), [`${resolved}.json`]);
 			assert.equal(JSON.parse(fs.readFileSync(replyFile, "utf8")).message, "Already answered");
+			// A child whose ask times out deletes its own request file; past the deadline, that is not reported as a withdrawal.
+			const deadline = Date.now() + 100;
+			const timedOut = writeRequest({ sessionId, runId, expiresAt: deadline });
+			await tool.execute("pending", { action: "pending" });
+			assert.equal(channel.pending.has(timedOut), true);
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			fs.rmSync(path.join(dir, "requests", `${timedOut}.json`));
+			await assert.rejects(tool.execute("late", { action: "reply", replyTo: timedOut, message: "Too late" }), new RegExp(`Supervisor request '${timedOut}' .* ended around its ask deadline at ${new Date(deadline).toISOString()}: either no reply arrived .* or its run was stopped just before then`));
 		} finally { channel.dispose(); }
 	});
 
@@ -893,9 +900,8 @@ describe("supervisor ask registration", () => {
 		} finally { channel.dispose(); }
 	});
 
-	// D1: `refreshPendingRequests` only re-evaluates asks already in `pending`; it never reads the
-	// filesystem. With no watcher installed and the demand-gated poller stopped, an ask written by
-	// a child was unfindable by ANY number of `action:"pending"` calls.
+	// `refreshPendingRequests` only re-evaluates asks already in `pending`; it never reads the
+	// filesystem.
 	it("discovers an ask written while nothing was polling", async () => {
 		const sessionId = `session-${randomUUID()}`;
 		const runId = `run-${randomUUID()}`;

@@ -7,7 +7,10 @@ export async function resolveGlobalNpmRoot(options: {
 	env?: NodeJS.ProcessEnv;
 	platform?: NodeJS.Platform;
 	timeoutMs?: number;
+	signal?: AbortSignal;
 } = {}): Promise<string | null> {
+	const signal = options.signal;
+	if (signal?.aborted) return null;
 	const env = options.env ?? process.env;
 	const offline = env.PI_OFFLINE?.toLowerCase();
 	if (offline === "1" || offline === "true" || offline === "yes") return null;
@@ -21,6 +24,7 @@ export async function resolveGlobalNpmRoot(options: {
 		}
 	}
 
+	if (signal?.aborted) return null;
 	const timeoutMs = options.timeoutMs ?? 5000;
 	const output = await new Promise<string | null>((resolve) => {
 		let settled = false;
@@ -28,6 +32,7 @@ export async function resolveGlobalNpmRoot(options: {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
+			signal?.removeEventListener("abort", cancel);
 			resolve(value);
 		};
 		const commandOptions = {
@@ -43,11 +48,13 @@ export async function resolveGlobalNpmRoot(options: {
 		const child = (options.platform ?? process.platform) === "win32"
 			? exec("npm root -g", commandOptions, callback)
 			: execFile("npm", ["root", "-g"], commandOptions, callback);
-		// Resolve at the deadline even if inherited pipes hold the callback open.
-		const timer = setTimeout(() => {
+		const cancel = () => {
 			child.kill();
 			finish(null);
-		}, timeoutMs);
+		};
+		// Resolve at the deadline even if inherited pipes hold the callback open.
+		const timer = setTimeout(cancel, timeoutMs);
+		signal?.addEventListener("abort", cancel, { once: true });
 	});
 	if (!output) return null;
 	try {

@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { Worker } from "node:worker_threads";
+import { WorkflowScriptProcess } from "../../src/workflows/workflow-script-worker.ts";
 import { formatChildToolDiagnostic } from "../../src/runs/shared/tool-availability.ts";
 import { formatWorkflowJsonPreview, previewSimpleWorkflowRun, runWorkflowScript, validateWorkflowScript, WorkflowScriptError, type WorkflowScriptChildResult } from "../../src/workflows/scripted-workflow.ts";
 import { workflowChildSummary } from "../../src/workflows/workflow-child-summary.ts";
@@ -389,6 +390,14 @@ describe("scripted workflow runtime", () => {
 		assert.ok((syntax.errors[0]?.column ?? 0) > 0);
 		assert.doesNotMatch(syntax.errors[0]?.message ?? "", /\(3:\d+\)$/);
 
+		for (const path of ["/tmp/x.json", "./wf.js", "~/flows/review.mjs"]) {
+			const [error] = validateWorkflowScript(` ${path}\n`).errors;
+			assert.ok(error?.message.endsWith(`. The script looks like a file path ('${path}'): options.script takes the script's source text; pass a script file as workflow: "${path}".`), path);
+			assert.equal(error?.line, 1, path);
+		}
+		assert.match(validateWorkflowScript("/[/.test(args.text);").errors[0]!.message, /^Unterminated regular expression/);
+		assert.match(validateWorkflowScript("return (;").errors[0]!.message, /^Unexpected token/);
+
 		const structural = validateWorkflowScript([
 			`const results = await runs.all([{ key: "bad key", agent: "worker" }, { key: "someChild", agent: "reviewer" }]);`,
 			`async function helper() { return "no"; }`,
@@ -420,6 +429,38 @@ describe("scripted workflow runtime", () => {
 
 		assert.deepEqual(validateWorkflowScript(`return runs.all([{ ...{ key: "bad key" }, agent: "worker" }]);`), { ok: true, errors: [] });
 		assert.deepEqual(validateWorkflowScript(`return runs.run("same", { agent: selectedAgent });`), { ok: true, errors: [] });
+	});
+
+	it("rejects runs.all items that are certain to have no key, and leaves the rest to the runtime", async () => {
+		for (const [script, message, line, column] of [
+			[`const results = await runs.all([\n  { key: "a", agent: "worker", task: "x" },\n  { agent: "worker", task: "y" },\n]);`, "runs.all item 1 has no key", 3, 3],
+			[`return runs.all(files.map((file) => ({ agent: "reviewer", task: file })));`, "runs.all items built by this map(...) callback have no key", 1, 38],
+			[`return runs.all(files.map(function (file) { const task = "Review " + file;\n  return { agent: "reviewer", task }; }));`, "runs.all items built by this map(...) callback have no key", 2, 10],
+		] as const) {
+			const result = validateWorkflowScript(script);
+			assert.equal(result.ok, false, script);
+			assert.deepEqual(result.errors, [{ message: `${message}; every runs.all item needs a stable key, for example runs.all([{ key: "review", agent, task }]).`, line, column }], script);
+		}
+		for (const script of [
+			`return runs.all([{ ...base, agent: "worker", task: "x" }]);`,
+			`return runs.all([{ [field]: "a", agent: "worker", task: "x" }]);`,
+			`return runs.all([{ __proto__: base, agent: "worker", task: "x" }]);`,
+			`return runs.all([{ then: child.then }]);`,
+			`return runs.all(files.map(makeItem));`,
+			`return runs.all(files.map((file) => ({ key: file, agent: "reviewer", task: file })));`,
+			`return runs.all(files.map((file) => { if (file.skip) return { agent: "worker", task: "x" }; return { key: file.name, agent: "worker", task: "y" }; }));`,
+			`const runs = { all: (items) => items };\nreturn runs.all([{ agent: "worker", task: "x" }]);`,
+		]) assert.equal(validateWorkflowScript(script).ok, true, script);
+
+		await assert.rejects(
+			runWorkflowScript({
+				script: `return await runs.all([{ agent: "worker", task: "x" }]);`,
+				timeoutMs: 2_000,
+				async launch(key) { return { key, ok: true, output: "unexpected", artifactPaths: [], results: [] }; },
+				async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+			}),
+			(error: unknown) => error instanceof WorkflowScriptError && /runs\.all item 0 has no key; keys must be 1-128 characters/.test(error.message),
+		);
 	});
 
 	it("reports literal child baseRef policy errors with source locations offline", () => {
@@ -1770,6 +1811,13 @@ describe("scripted workflow runtime", () => {
 			["reviewer", "Read-only review. Do not edit files. /usr/bin/rm -rf ."],
 			["reviewer", "Read-only review. Do not edit files. /usr/local/bin/rm -rf ."],
 			["reviewer", "Read-only review. Do not edit files. Validation after fix: git -C . reset --hard."],
+			["reviewer", "Read-only review. Do not edit files. git -C -1 reset --hard"],
+			["reviewer", "Read-only review. Do not edit files. git --work-tree='dir with spaces' reset --hard"],
+			["reviewer", 'Read-only review. Do not edit files. git --work-tree="dir with spaces" reset --hard'],
+			["reviewer", 'Read-only review. Do not edit files. git -C "x -a reset"'],
+			["reviewer", "Read-only review. Do not edit files. git -C 'git reset' status"],
+			["reviewer", 'Read-only review. Do not edit files. git -c "x reset"'],
+			["reviewer", "Read-only review. Do not edit files. git -C --hard reset"],
 			["reviewer", "Read-only review. Do not edit files. git --work-tree . reset --hard."],
 			["reviewer", "Read-only review. Do not edit files. git --work-tree \"/tmp/my repo\" reset --hard."],
 			["reviewer", "Read-only review. Do not edit files. git --work-tree '/tmp/my repo' reset --hard."],
@@ -1783,6 +1831,7 @@ describe("scripted workflow runtime", () => {
 			["reviewer", "Read-only review. Do not edit files. git stash."],
 			["reviewer", "Read-only review. Do not edit files. git revert abc123."],
 			["reviewer", "Read-only review. Do not edit files. Stage the changed files."],
+			["reviewer", "Read-only review. Do not edit files. git --no-pager commit -m fix."],
 			["reviewer", "Read-only review. Do not edit files. git reset --hard"],
 			["reviewer", "Read-only review. Do not edit files. git restore src/workflows/scripted-workflow.ts"],
 		]) {
@@ -1813,6 +1862,133 @@ describe("scripted workflow runtime", () => {
 				(error: unknown) => error instanceof WorkflowScriptError && /only explicit read-only review children with acceptance:false may follow/.test(error.message),
 			);
 			assert.deepEqual(launches, ["writer"]);
+		}
+	});
+
+	const reviewRecovery = {
+		status: "available-for-review" as const,
+		reason: "acceptance-metadata-rejected" as const,
+		reportPath: "/tmp/writer-report.md",
+		reportHash: "a".repeat(64),
+	};
+	const runReviewAfterRejectedWriter = (task: string) => {
+		const launches: string[] = [];
+		const run = runWorkflowScript({
+			script: `
+				const writer = await runs.run("writer", { agent: "worker", task: "write" });
+				const review = await runs.run("review", { agent: "reviewer", task: ${JSON.stringify(task)}, acceptance: false });
+				return review.ok;
+			`,
+			launch(key) {
+				launches.push(key);
+				if (key === "writer") {
+					return Promise.resolve({
+						key,
+						ok: false,
+						output: "saved writer report",
+						error: "Acceptance rejected: malformed acceptance-report",
+						runId: "writer-run",
+						outputReference: reviewRecovery.reportPath,
+						recovery: reviewRecovery,
+						artifactPaths: [reviewRecovery.reportPath],
+						results: [{ acceptance: { status: "rejected", recovery: reviewRecovery } }],
+					});
+				}
+				return Promise.resolve({ key, ok: true, output: "review complete", runId: "review-run", artifactPaths: [] });
+			},
+			async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
+		});
+		return { launches, run };
+	};
+
+	it("preserves file-command detection after a durable acceptance metadata rejection", async () => {
+		for (const [command, blocked] of [
+			["rm -rf .", true],
+			["/usr/bin/rmdir dir", true],
+			["folder'part/unlink file", true],
+			['folder"part/truncate file', true],
+			["folder;part/mv a b", true],
+			["folder,part/cp a b", true],
+			["folder(part[part{part/CHMOD file", true],
+			["folder`part/chown file", true],
+			["folder.part/rmé", true],
+			["xrm", false],
+			["folder-rm", false],
+			["/usr/bin/rm_", false],
+			["/usr/bin/rmdirx", false],
+			["folder'part/rmx", false],
+			["folder\\rm", false],
+			// Short git options take only separated values, so -C=x is not a work-tree option.
+			["git -C=x reset", false],
+		] as const) {
+			const { launches, run } = runReviewAfterRejectedWriter(`Read-only review. Do not edit files. ${command}`);
+			if (blocked) {
+				await assert.rejects(run, (error: unknown) => error instanceof WorkflowScriptError && /only explicit read-only review children with acceptance:false may follow/.test(error.message), command);
+			} else {
+				assert.equal((await run).value, true, command);
+			}
+			assert.deepEqual(launches, blocked ? ["writer"] : ["writer", "review"], command);
+		}
+	});
+
+	it("blocks dash-live actions and allows inert separator text after a durable acceptance metadata rejection", async () => {
+		// Every separator reaches a live action even when another separator sits inside the line it
+		// has to scan.
+		for (const task of [
+			"Read-only review. Do not edit files. Delta — git log:x8 checkout main. Return findings only.",
+			"Read-only review. Do not edit files. Delta – git status:restore. Return findings only.",
+			"Read-only review. Do not edit files. Delta -- git log:x8 switch main. Return findings only.",
+		]) {
+			const { launches, run } = runReviewAfterRejectedWriter(task);
+			await assert.rejects(
+				run,
+				(error: unknown) => error instanceof WorkflowScriptError && /only explicit read-only review children with acceptance:false may follow/.test(error.message),
+			);
+			assert.deepEqual(launches, ["writer"]);
+		}
+		// Separator text whose branch never reaches its word stays allowed.
+		for (const task of [
+			"Read-only review. Do not edit files. Delta — workers. Return findings only.",
+			"Read-only review. Do not edit files. Delta — git log. Return findings only.",
+			"Read-only review. Do not edit files. Delta — /my-dir/notes.md. Return findings only.",
+			"Read-only review. Do not edit files. Delta — run. Return findings only.",
+			"Read-only review. Do not edit files. Delta — then review the patch. Return findings only.",
+			"Read-only review. Do not edit files. Delta — rmaware. Return findings only.",
+			"Read-only review. Do not edit files. Delta — git logging:x8. Return findings only.",
+			"Read-only review. Do not edit files. Delta - review the patch. Return findings only.",
+		]) {
+			const { launches, run } = runReviewAfterRejectedWriter(task);
+			assert.equal((await run).value, true);
+			assert.deepEqual(launches, ["writer", "review"]);
+		}
+	});
+
+	it("scans adversarial read-only review prompts in bounded time", async () => {
+		// Each prompt repeats one quote, separator or git-option family, 100,000 to 280,000 characters.
+		// The elapsed-time assertion includes the workflow process.
+		for (const stream of [
+			"'".repeat(100_000),
+			'"'.repeat(100_000),
+			";,.([{`".repeat(15_000),
+			"/".repeat(100_000),
+			`git${" -a".repeat(66_000)}`,
+			"git -a ".repeat(25_000),
+			"--/".repeat(90_000),
+			"—/".repeat(75_000),
+			":/".repeat(90_000),
+			"-- git ".repeat(40_000),
+		]) {
+			const startedAt = performance.now();
+			const { launches, run } = runReviewAfterRejectedWriter(`Read-only review. Do not edit files. ${stream}`);
+			const result = await run;
+			const elapsedMs = performance.now() - startedAt;
+
+			assert.deepEqual(launches, ["writer", "review"]);
+			assert.equal(result.value, true);
+			assert.ok(
+				elapsedMs < 10_000,
+				`the read-only review scan took ${Math.round(elapsedMs)} ms on a ${stream.length}-character prompt`,
+			);
 		}
 	});
 
@@ -2498,6 +2674,9 @@ describe("scripted workflow runtime", () => {
 
 	it("steers a still-running sibling after Promise.race and awaits both children", async () => {
 		let resolveSlow!: (result: { key: string; ok: true; output: string; artifactPaths: never[] }) => void;
+		// The host can take a runs.steer call before it has started the launch it follows, so steer waits for it.
+		let slowLaunched!: () => void;
+		const slowStarted = new Promise<void>((resolve) => { slowLaunched = resolve; });
 		const result = await runWorkflowScript({
 			script: `
 				const fast = runs.run("fast", { agent: "worker", task: "fast" });
@@ -2509,13 +2688,14 @@ describe("scripted workflow runtime", () => {
 			`,
 			launch(key) {
 				if (key === "fast") return Promise.resolve({ key, ok: true, output: "fast", artifactPaths: [] });
-				return new Promise((resolve) => { resolveSlow = resolve; });
+				return new Promise((resolve) => { resolveSlow = resolve; slowLaunched(); });
 			},
 			async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
 			async steer(key, message, options) {
 				assert.equal(key, "slow");
 				assert.equal(message, "Focus on tests.");
 				assert.deepEqual(options, { mode: "auto", index: 0, ackTimeoutMs: 100 });
+				await slowStarted;
 				resolveSlow({ key, ok: true, output: "slow", artifactPaths: [] });
 				return { key, state: "delivered", requestId: "request-1", deliveryStatus: "delivered", targets: [{ index: 0, state: "delivered" }] };
 			},
@@ -2532,6 +2712,9 @@ describe("scripted workflow runtime", () => {
 	it("uses Promise.race to roll through child completions and steer the remaining work", async () => {
 		let resolveBeta!: (result: { key: string; ok: true; output: string; artifactPaths: never[] }) => void;
 		let resolveGamma!: (result: { key: string; ok: true; output: string; artifactPaths: never[] }) => void;
+		let launched!: () => void;
+		let pendingLaunches = 2;
+		const betaAndGammaStarted = new Promise<void>((resolve) => { launched = () => { if (--pendingLaunches === 0) resolve(); }; });
 		const result = await runWorkflowScript({
 			script: `
 				let pending = [
@@ -2550,14 +2733,15 @@ describe("scripted workflow runtime", () => {
 			`,
 			launch(key) {
 				if (key === "alpha") return Promise.resolve({ key, ok: true, output: "alpha done", artifactPaths: [] });
-				if (key === "beta") return new Promise((resolve) => { resolveBeta = resolve; });
-				return new Promise((resolve) => { resolveGamma = resolve; });
+				if (key === "beta") return new Promise((resolve) => { resolveBeta = resolve; launched(); });
+				return new Promise((resolve) => { resolveGamma = resolve; launched(); });
 			},
 			async status(key) { return { key, ok: true, output: "ok", artifactPaths: [] }; },
 			async steer(key, message, options) {
 				assert.equal(key, "gamma");
 				assert.equal(message, "Challenge the first result: alpha done");
 				assert.deepEqual(options, { mode: "auto", ackTimeoutMs: 100 });
+				await betaAndGammaStarted;
 				resolveGamma({ key, ok: true, output: "gamma done", artifactPaths: [] });
 				setTimeout(() => resolveBeta({ key: "beta", ok: true, output: "beta done", artifactPaths: [] }), 5);
 				return { key, state: "delivered", requestId: "request-rolling", deliveryStatus: "delivered", targets: [{ index: 0, state: "delivered" }] };
@@ -2613,7 +2797,8 @@ describe("scripted workflow runtime", () => {
 		let childAborted = false;
 		await assert.rejects(
 			runWorkflowScript({
-				script: `runs.run("bg", { agent: "worker", task: "fire and forget" }); return "done";`,
+				// The status round trip ensures the host has started the launch; a launch still queued at completion is never started.
+				script: `runs.run("bg", { agent: "worker", task: "fire and forget" }); await runs.status("probe"); return "done";`,
 				timeoutMs: 2_000,
 				launch(_key, _params, signal) {
 					return new Promise((_resolve, reject) => signal.addEventListener("abort", () => {
@@ -3289,14 +3474,15 @@ describe("scripted workflow runtime", () => {
 	});
 
 	it("ignores a queued child launch message after workflow abort", async () => {
-		const originalOn = Worker.prototype.on;
+		const workerPrototype = (process.versions.bun ? Worker.prototype : WorkflowScriptProcess.prototype) as unknown as { on: typeof Worker.prototype.on };
+		const originalOn = workerPrototype.on;
 		const controller = new AbortController();
 		let launchCount = 0;
 		let deliverCapturedRunMessage: (() => void) | undefined;
 		let markRunMessageCaptured!: () => void;
 		const runMessageCaptured = new Promise<void>((resolve) => { markRunMessageCaptured = resolve; });
 
-		(Worker.prototype as unknown as { on: typeof Worker.prototype.on }).on = function (event: string | symbol, listener: (...args: unknown[]) => void) {
+		workerPrototype.on = function (event: string | symbol, listener: (...args: unknown[]) => void) {
 			if (event !== "message") return originalOn.call(this, event, listener);
 			const wrapped = (message: Record<string, unknown>) => {
 				if (message.type === "call" && message.method === "run") {
@@ -3327,7 +3513,7 @@ describe("scripted workflow runtime", () => {
 			await new Promise((resolve) => queueMicrotask(resolve));
 			assert.equal(launchCount, 0);
 		} finally {
-			Worker.prototype.on = originalOn;
+			workerPrototype.on = originalOn;
 		}
 	});
 
@@ -3433,7 +3619,7 @@ describe("scripted workflow runtime", () => {
 	});
 
 	it("drops a child response that settles after the workflow aborts", async () => {
-		const workerPrototype = Worker.prototype as unknown as { postMessage(value: unknown, ...args: unknown[]): void };
+		const workerPrototype = (process.versions.bun ? Worker.prototype : WorkflowScriptProcess.prototype) as unknown as { postMessage(value: unknown, ...args: unknown[]): void };
 		const originalPostMessage = workerPrototype.postMessage;
 		const controller = new AbortController();
 		let workflowSettled = false;
@@ -3529,10 +3715,10 @@ describe("scripted workflow runtime", () => {
 	});
 
 	it("keeps every child alive when a host trace callback throws", async () => {
-		// Regression: hosts persist a status journal from onTrace, and onTrace is called
-		// from inside the run-promise handlers. A failed status write used to reject the
-		// child promise, so one locked status.json marked a finished child failed and
-		// aborted its still-running siblings through Promise.all inside runs.all.
+		// Hosts persist a status journal from onTrace, and onTrace is called
+		// from inside the run-promise handlers. If a failed status write rejected the child
+		// promise, one locked status.json would mark a finished child failed and abort its
+		// still-running siblings through Promise.all inside runs.all.
 		let thrown = 0;
 		const abortedWhileRunning: string[] = [];
 		const result = await runWorkflowScript({
@@ -3788,7 +3974,7 @@ describe("scripted workflow runtime", () => {
 			const result = await nextChildMessage(child);
 			assert.equal(result.ok, true, String(result.error ?? stderr));
 			assert.equal(result.chdirCalls, 0, "healthy launch must never invoke process.chdir");
-			assert.deepEqual(result.workerInitCwds, [expectedCallerCwd], "Worker init hooks must only observe the caller cwd");
+			assert.deepEqual(result.workerInitCwds, [expectedCallerCwd], "Workflow executor init hooks must only observe the caller cwd");
 		} finally {
 			await stopChild(child);
 			fs.rmSync(root, { recursive: true, force: true });
