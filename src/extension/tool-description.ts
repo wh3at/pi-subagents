@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { ExtensionConfig, ToolDescriptionMode } from "../shared/types.ts";
 import { getAgentDir, getProjectConfigDir } from "../shared/utils.ts";
 import { resolveDisabledFeatureSurface, type DisabledFeatureSurface, type SubagentSurfaceFeature } from "../shared/disabled-features.ts";
+import { DEFAULT_WAIT_TOOL_NAME, waitToolName } from "../shared/wait-tool-name.ts";
 
 const CUSTOM_TOOL_DESCRIPTION_FILE = "subagent-tool-description.md";
 const CUSTOM_TOOL_DESCRIPTION_MAX_BYTES = 50 * 1024;
@@ -180,6 +181,12 @@ function withMandatorySafetyGuidance(description: string): string {
 }
 
 export function buildSubagentToolDescription(config: Pick<ExtensionConfig, "toolDescriptionMode"> = {}, options?: ToolDescriptionOptions): string {
+	const description = describeSubagentTool(config, options);
+	const name = waitToolName();
+	return name === DEFAULT_WAIT_TOOL_NAME ? description : description.replace(/\bbg_wait\b/g, name);
+}
+
+function describeSubagentTool(config: Pick<ExtensionConfig, "toolDescriptionMode">, options?: ToolDescriptionOptions): string {
 	const on = options?.disabledFeatures ? featureText(options.disabledFeatures) : allEnabled;
 	if (config.toolDescriptionMode === undefined) return essentials(on);
 	const mode = resolveToolDescriptionMode(config, options);
