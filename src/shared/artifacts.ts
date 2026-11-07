@@ -3,6 +3,8 @@ import * as path from "node:path";
 import { CHAIN_RUNS_DIR, TEMP_ARTIFACTS_DIR, type ArtifactPaths, type ArtifactDirPreference } from "./types.ts";
 import { getAgentDir } from "./utils.ts";
 const CLEANUP_MARKER_FILE = ".last-cleanup";
+// Kept worktrees can outlive cleanupDays; their handoff record and the patches it points to must stay with them.
+const RETAINED_ARTIFACT_DIRS = new Set(["handoffs", "worktree-diffs"]);
 export const PROJECT_SUBAGENTS_RELATIVE_DIR = ".pi/subagents";
 
 const PROJECT_ARTIFACT_PATHS = [
@@ -237,21 +239,29 @@ export function cleanupOldArtifacts(dir: string, maxAgeDays: number): void {
 	const maxAgeMs = maxAgeDays * 24 * 60 * 60 * 1000;
 	const cutoff = now - maxAgeMs;
 
-	for (const file of fs.readdirSync(dir)) {
-		if (file === CLEANUP_MARKER_FILE) continue;
-		const filePath = path.join(dir, file);
-		try {
-			const stat = fs.statSync(filePath);
-			if (stat.mtimeMs < cutoff) {
-				fs.unlinkSync(filePath);
-			}
-		} catch {
-			// Artifact cleanup is best-effort housekeeping. Skip files that disappear
-			// or become unreadable while scanning so one bad entry does not block the rest.
-		}
+	for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+		if (entry.name === CLEANUP_MARKER_FILE || (entry.isDirectory() && RETAINED_ARTIFACT_DIRS.has(entry.name))) continue;
+		removeOldEntry(path.join(dir, entry.name), cutoff);
 	}
 
 	fs.writeFileSync(markerPath, String(now));
+}
+
+function removeOldEntry(entryPath: string, cutoff: number): void {
+	try {
+		const stat = fs.lstatSync(entryPath);
+		// Read the folder's age before emptying it: removing its files makes it look new.
+		const old = stat.mtimeMs < cutoff;
+		if (!stat.isDirectory()) {
+			if (old) fs.unlinkSync(entryPath);
+			return;
+		}
+		for (const name of fs.readdirSync(entryPath)) removeOldEntry(path.join(entryPath, name), cutoff);
+		if (old && fs.readdirSync(entryPath).length === 0) fs.rmdirSync(entryPath);
+	} catch {
+		// Artifact cleanup is best-effort housekeeping. Skip entries that disappear
+		// or become unreadable while scanning so one bad entry does not block the rest.
+	}
 }
 
 export function cleanupAllArtifactDirs(maxAgeDays: number): void {
