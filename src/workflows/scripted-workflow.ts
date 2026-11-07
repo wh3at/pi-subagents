@@ -19,6 +19,7 @@ function validGitRef(ref: unknown): ref is string {
 }
 const requireFromPackage = createRequire(import.meta.url);
 const WORKFLOW_ASSEMBLY_FLUSH_TIMEOUT_MS = 5_000;
+const WORKFLOW_DRAIN_CHILD_MESSAGE = "Workflow draining; child not started.";
 
 export interface WorkflowScriptValidationError {
 	message: string;
@@ -209,6 +210,8 @@ export interface RunWorkflowScriptOptions {
 		set: (key: string, value: unknown) => void | Promise<void>;
 	};
 	registerStopChild?: (stop: ((key: string, message?: string) => boolean) | undefined) => void;
+	/** Drain: stop children that have not started, refuse new launches, and call `onDrained` once every started child has a result. Returns the started-child count. */
+	registerDrain?: (drain: ((onDrained: () => void) => number) | undefined) => void;
 	onTrace?: (trace: WorkflowScriptTraceEntry[]) => void;
 	onLanePlan?: (lanes: WorkflowLanePlan[]) => void;
 	onEmit?: (emits: unknown[]) => void;
@@ -860,24 +863,59 @@ function directObjectPropertyValue(node: AstNode, name: string): AstNode | undef
 	return value;
 }
 
-function validateStaticBaseRef(params: AstNode, owner: string): WorkflowScriptValidationError[] {
-	if (params.type !== "ObjectExpression" || !Array.isArray(params.properties)) return [];
-	// Inspect the final definition only. A later spread or unknown key may overwrite it.
-	for (let index = params.properties.length - 1; index >= 0; index--) {
-		const property = params.properties[index];
-		if (!astNode(property) || property.type !== "Property") return [];
+function arrayElements(node: unknown): unknown[] {
+	return astNode(node) && node.type === "ArrayExpression" && Array.isArray(node.elements) ? node.elements : [];
+}
+
+/** The final definition of `name` in an object literal; undefined when a later spread or unknown key may overwrite it. */
+function finalStaticProperty(node: AstNode, name: string): AstNode | undefined {
+	if (node.type !== "ObjectExpression" || !Array.isArray(node.properties)) return undefined;
+	for (let index = node.properties.length - 1; index >= 0; index--) {
+		const property = node.properties[index];
+		if (!astNode(property) || property.type !== "Property") return undefined;
 		const key = staticPropertyKey(property);
-		if (key === undefined) return [];
-		if (key !== "baseRef") continue;
-		if (property.kind !== "init" || !astNode(property.value)) return [];
-		const valueNode = property.value;
-		const value = literalString(valueNode);
-		if ((value !== undefined || valueNode.type === "Literal") && !validGitRef(value)) {
-			return [{ message: `${owner} ${BASE_REF_VALIDATION_ERROR}`, ...nodeLocation(valueNode) }];
-		}
-		return [];
+		if (key === undefined) return undefined;
+		if (key === name) return property;
 	}
-	return [];
+	return undefined;
+}
+
+function validateStaticBaseRef(params: AstNode, owner: string): WorkflowScriptValidationError[] {
+	const property = finalStaticProperty(params, "baseRef");
+	if (property?.kind !== "init" || !astNode(property.value)) return [];
+	const valueNode = property.value;
+	const value = literalString(valueNode);
+	return (value !== undefined || valueNode.type === "Literal") && !validGitRef(value)
+		? [{ message: `${owner} ${BASE_REF_VALIDATION_ERROR}`, ...nodeLocation(valueNode) }]
+		: [];
+}
+
+// Same text as validateLaneSpecs in workflow-script-worker.cjs; a test compares the two.
+const LANE_RETAINED_RESUME_ERROR = "cannot resume a retained run id in runs.lanes; use runs.run(key, { resume: id }) outside lanes, or start the lane with an agent stage and use resume: \"previous\" later.";
+
+// A spread or unknown computed key on the lane can replace `stages`.
+function staticLane(lane: unknown): lane is AstNode {
+	return astNode(lane) && lane.type === "ObjectExpression" && Array.isArray(lane.properties)
+		&& lane.properties.every((property) => astNode(property) && property.type === "Property" && staticPropertyKey(property) !== undefined);
+}
+
+/** The launch-time first-stage resume rule, for lanes written out as literals. */
+function validateStaticLaneResumes(call: AstNode): WorkflowScriptValidationError[] {
+	const args = Array.isArray(call.arguments) ? call.arguments : [];
+	const lanes = arrayElements(args[0]);
+	const errors: WorkflowScriptValidationError[] = [];
+	for (let laneIndex = 0; laneIndex < lanes.length; laneIndex++) {
+		const lane = lanes[laneIndex];
+		// A spread shifts every later lane index the runtime reports.
+		if (astNode(lane) && lane.type === "SpreadElement") break;
+		if (!staticLane(lane)) continue;
+		const first = arrayElements(directObjectPropertyValue(lane, "stages"))[0];
+		if (!astNode(first)) continue;
+		const property = finalStaticProperty(first, "resume");
+		const resume = property?.kind === "init" ? literalString(property.value) : undefined;
+		if (resume !== undefined && resume !== "previous") errors.push({ message: `runs.lanes lane ${laneIndex} stage 0 ${LANE_RETAINED_RESUME_ERROR}`, ...nodeLocation(first) });
+	}
+	return errors;
 }
 
 // Children with their own cwd, agentScope, or resume resolve agents elsewhere, and a
@@ -896,16 +934,12 @@ function staticChildAgentNode(params: unknown): AstNode | undefined {
 
 function validateStaticChildAgents(call: AstNode, agentNameError: (name: string) => string | undefined): WorkflowScriptValidationError[] {
 	const args = Array.isArray(call.arguments) ? call.arguments : [];
-	const elements = (node: unknown): unknown[] => astNode(node) && node.type === "ArrayExpression" && Array.isArray(node.elements) ? node.elements : [];
-	// A spread or unknown computed key on the lane can replace `stages`.
-	const staticLane = (lane: unknown): lane is AstNode => astNode(lane) && lane.type === "ObjectExpression" && Array.isArray(lane.properties)
-		&& lane.properties.every((property) => astNode(property) && property.type === "Property" && staticPropertyKey(property) !== undefined);
 	const children: Array<{ owner: string; params: unknown }> = directRunsCall(call, "run")
 		? [{ owner: "runs.run", params: args[1] }]
 		: directRunsCall(call, "all")
-			? elements(args[0]).map((params) => ({ owner: "runs.all item", params }))
+			? arrayElements(args[0]).map((params) => ({ owner: "runs.all item", params }))
 			: directRunsCall(call, "lanes")
-				? elements(args[0]).flatMap((lane) => staticLane(lane) ? elements(directObjectPropertyValue(lane, "stages")).map((params) => ({ owner: "runs.lanes stage", params })) : [])
+				? arrayElements(args[0]).flatMap((lane) => staticLane(lane) ? arrayElements(directObjectPropertyValue(lane, "stages")).map((params) => ({ owner: "runs.lanes stage", params })) : [])
 				: [];
 	const errors: WorkflowScriptValidationError[] = [];
 	for (const child of children) {
@@ -919,8 +953,7 @@ function validateStaticChildAgents(call: AstNode, agentNameError: (name: string)
 
 function directRunsAllKeys(call: AstNode): Array<{ key: string; node: AstNode }> {
 	const args = Array.isArray(call.arguments) ? call.arguments : [];
-	const items = astNode(args[0]) && args[0].type === "ArrayExpression" && Array.isArray(args[0].elements) ? args[0].elements : [];
-	return items.flatMap((item) => {
+	return arrayElements(args[0]).flatMap((item) => {
 		if (!astNode(item)) return [];
 		const keyNode = directObjectPropertyValue(item, "key");
 		const key = literalString(keyNode);
@@ -1127,15 +1160,14 @@ export function validateWorkflowScript(script: string, options: WorkflowScriptVa
 				errors.push({ message: `${subject}; every runs.all item needs a stable key, for example runs.all([{ key: "review", agent, task }]).`, ...nodeLocation(item.node) });
 			}
 			const args = Array.isArray(node.arguments) ? node.arguments : [];
-			if (astNode(args[0]) && args[0].type === "ArrayExpression" && Array.isArray(args[0].elements)) {
-				for (const item of args[0].elements) if (astNode(item)) {
-					errors.push(...validateStaticBaseRef(item, "runs.all item"));
-					const message = definitelyNonJson(item);
-					if (message) errors.push({ message: `runs.all item params are invalid: ${message}.`, ...nodeLocation(item) });
-				}
+			for (const item of arrayElements(args[0])) if (astNode(item)) {
+				errors.push(...validateStaticBaseRef(item, "runs.all item"));
+				const message = definitelyNonJson(item);
+				if (message) errors.push({ message: `runs.all item params are invalid: ${message}.`, ...nodeLocation(item) });
 			}
 		}
 		if (directRunsCall(node, "host")) errors.push(...validateStaticHostCall(node));
+		if (directRunsCall(node, "lanes") && !runsRebound) errors.push(...validateStaticLaneResumes(node));
 		if (agentNameError) errors.push(...validateStaticChildAgents(node, agentNameError));
 		const boundaryValue = node.type === "CallExpression" && astNode(node.callee) && node.callee.type === "Identifier" && node.callee.name === "emit" && Array.isArray(node.arguments) && astNode(node.arguments[0])
 			? node.arguments[0]
@@ -1165,7 +1197,7 @@ export function validateWorkflowScript(script: string, options: WorkflowScriptVa
 				const keys = new Set(directRunsAllKeys(declaration.init.argument).map((entry) => entry.key));
 				if (keys.size === 0) continue;
 				const args = Array.isArray(declaration.init.argument.arguments) ? declaration.init.argument.arguments : [];
-				const itemCount = astNode(args[0]) && args[0].type === "ArrayExpression" && Array.isArray(args[0].elements) ? args[0].elements.length : 0;
+				const itemCount = arrayElements(args[0]).length;
 				const arrayResultShape = Array.from({ length: itemCount });
 				for (const later of laterStatements) {
 					walkAstWithoutShadowedIdentifier(later, name, (node) => {
@@ -1327,6 +1359,10 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	let acceptanceRecoveryBarrier: { key: string } | undefined;
 	let settled = false;
 	let finishing = false;
+	let draining = false;
+	let onDrained: (() => void) | undefined;
+	// Keys past the concurrency semaphore: a drain lets these finish and stops the rest.
+	const acquiredLaunches = new Set<string>();
 	let assemblyAbortRequested = false;
 	let assemblyFlushTimer: ReturnType<typeof setTimeout> | undefined;
 	let abortError: Error | undefined;
@@ -1373,6 +1409,12 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 	const recordAcceptanceRecoveryBarrier = (key: string, result: WorkflowScriptChildResult): void => {
 		if (isAcceptanceMetadataRecovery(result)) acceptanceRecoveryBarrier = { key };
 	};
+	const drainIfIdle = (): void => {
+		if (!onDrained || [...launches.keys()].some((key) => !children.has(key))) return;
+		const done = onDrained;
+		onDrained = undefined;
+		done();
+	};
 	const stopChild = (key: string, message = `Workflow child '${key}' stopped.`): boolean => {
 		if (!launches.has(key) || children.has(key)) return false;
 		stoppedLaunches.add(key);
@@ -1390,7 +1432,18 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			error: message,
 		});
 		traceChanged();
+		drainIfIdle();
 		return true;
+	};
+	const drain = (done: () => void): number => {
+		if (!draining) {
+			draining = true;
+			onDrained = done;
+		}
+		for (const key of launches.keys()) if (!acquiredLaunches.has(key)) stopChild(key, WORKFLOW_DRAIN_CHILD_MESSAGE);
+		const started = [...launches.keys()].filter((key) => !children.has(key)).length;
+		drainIfIdle();
+		return started;
 	};
 	const notifyChildSettled = (key: string, result: WorkflowScriptChildResult): void => {
 		if (result.state === "running" || !options.onChildSettled || !options.workflowRunId) return;
@@ -1418,6 +1471,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 		}
 	};
 	options.registerStopChild?.(stopChild);
+	options.registerDrain?.(drain);
 
 	return await new Promise<WorkflowScriptResult>((resolve, reject) => {
 		const finish = (outcome: { value: unknown } | { error: Error & { workflowErrorKind?: unknown } }) => {
@@ -1432,6 +1486,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				if (settled) return;
 				settled = true;
 				options.registerStopChild?.(undefined);
+				options.registerDrain?.(undefined);
 				if (timer) clearTimeout(timer);
 				options.signal?.removeEventListener("abort", onAbort);
 				void worker.terminate();
@@ -1572,7 +1627,8 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			const respond = (promise: Promise<unknown>, responsePath?: string, onBoundaryError?: (error: unknown) => void) => {
 				void promise.then(
 					(value) => {
-						if (settled) return;
+						// While draining, the script gets no answers: a refusal it throws on would abort the started children.
+						if (settled || draining) return;
 						const normalized = responsePath ? omitNonJsonWorkflowResultMetadata(value) : omitUndefinedWorkflowValues(value);
 						if (!responsePath) {
 							worker.postMessage({ type: "response", callId: message.callId, ok: true, value: normalized });
@@ -1587,7 +1643,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 						}
 					},
 					(error: unknown) => {
-						if (!settled) {
+						if (!settled && !draining) {
 							const errorKind = error instanceof Error ? (error as { workflowErrorKind?: unknown }).workflowErrorKind : undefined;
 							worker.postMessage({ type: "response", callId: message.callId, ok: false, error: error instanceof Error ? error.message : String(error), ...(isWorkflowScriptFailureKind(errorKind) ? { errorKind } : {}) });
 						}
@@ -1672,6 +1728,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					return respond(Promise.reject(error));
 				}
 				if (acceptanceRecoveryBarrier) return respond(Promise.reject(new Error(recoveryBarrierMessage(acceptanceRecoveryBarrier.key, `runs.host('${key}')`))));
+				if (draining) return respond(Promise.reject(new Error(`runs.host('${key}') refused: the workflow is draining.`)));
 				if (!options.host) return respond(Promise.reject(new Error("runs.host is unavailable in this host context.")));
 				if (hostCalls.size >= HOST_STEP_MAX_COUNT) return respond(Promise.reject(new Error(`workflowScript supports at most ${HOST_STEP_MAX_COUNT} runs.host calls.`)));
 				const startedAt = Date.now();
@@ -1801,7 +1858,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 					return true;
 				});
 				admission = Promise.resolve().then(() => {
-					if (settled || finishing) return;
+					if (settled || finishing || draining) return;
 					for (const call of calls) assertRecoveryBarrierAllowsRun(call.key, call.params);
 					return options.admit?.(calls, childController.signal);
 				});
@@ -1809,6 +1866,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 			}
 			let resolvedResumeLineage: string[] | undefined;
 			const promise = admission.then(async () => {
+				if (draining) stopChild(key, WORKFLOW_DRAIN_CHILD_MESSAGE);
 				if (settled || finishing || stoppedLaunches.has(key)) {
 					const reason = childController.signal.reason;
 					const text = children.get(key)?.error ?? (reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "Workflow script aborted.");
@@ -1850,6 +1908,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 						const text = children.get(key)?.error ?? (reason instanceof Error ? reason.message : typeof reason === "string" ? reason : "Workflow script aborted.");
 						return stoppedChildResult(key, text);
 					}
+					acquiredLaunches.add(key);
 					const result = await options.launch(key, launchParams, childSignal, { admitted: true, batch: batch !== undefined });
 					const autoResumeParams = setupAbortResumeParams(params, result, childSignal);
 					if (!autoResumeParams) return result;
@@ -1879,6 +1938,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				trace.push(settledEntry);
 				traceChanged();
 				notifyChildSettled(key, normalized);
+				drainIfIdle();
 				return normalized;
 			}, (error: unknown) => {
 				const text = error instanceof Error ? error.message : String(error);
@@ -1889,6 +1949,7 @@ export async function runWorkflowScript(options: RunWorkflowScriptOptions): Prom
 				trace.push({ operation: "run", key, state: "failed", durationMs: Date.now() - startedAt, ...workflowStringMetadata(params), ...(generatedLaneKey ? { generatedLaneKey } : {}), error: text });
 				traceChanged();
 				notifyChildSettled(key, failure);
+				drainIfIdle();
 				return failure;
 			});
 			launches.set(key, { fingerprint, promise, observed: callObserved, ...(generatedLaneKey ? { generatedLaneKey } : {}) });

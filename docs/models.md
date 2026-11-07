@@ -164,6 +164,10 @@ Set `subagents.defaultSubagentOnlyExtensions` to give agents without a `subagent
 
 The two defaults resolve independently, with an explicitly present project value winning over the user value. If both are set, `defaultExtensions` still disables ambient discovery and the child-only paths are loaded alongside its allowlist. Both reject non-arrays, non-string or blank entries with an error naming the setting and source file. Extension paths execute trusted code, so use project defaults only for trusted repositories and extensions.
 
+## Global context default
+
+Set `subagents.defaultInheritGlobalContext: true` to give every builtin, package, user and project agent your global context file (such as `~/.pi/agent/AGENTS.md`). An agent that declares `inheritGlobalContext` in its frontmatter keeps its own value, and `agentOverrides.<name>.inheritGlobalContext` still wins over both, so `false` in either place opts that agent out. A project value wins over the user value. The setting only matters for agents with `inheritProjectContext: true` (every builtin agent has it); without project context a child gets no context files at all. Runtime-registered agents keep their extension's value. A non-boolean value is rejected with an error naming the settings file.
+
 ## Inspecting the live mapping
 
 To see what `pi-subagents` has actually loaded right now:
@@ -184,9 +188,9 @@ You do not have to spell a model exactly. Model ids are matched fuzzily against 
 - Case differences: `Claude-Sonnet-4` vs `claude-sonnet-4`
 - Optional trailing date stamps: `claude-haiku-4-5-20251001` or `claude-haiku-4-5-2025-10-01` vs `claude-haiku-4-5`
 
-Exact `provider/id` matches still win, and a qualified provider query never silently switches providers — it only matches within the named provider. Ambiguous bare ids that exist under multiple providers still require a provider prefix or the current session's provider to disambiguate.
+Exact `provider/id` matches still win, and a qualified provider query never silently switches providers — it only matches within the named provider. This holds for providers you are not signed in to: without Anthropic credentials, `anthropic/claude-opus-4-8` fails with an error that names the OpenRouter copy (`openrouter/anthropic/claude-opus-4.8`) instead of running it. Ambiguous bare ids that exist under multiple providers still require a provider prefix or the current session's provider to disambiguate.
 
-Registry ids that themselves contain `/` (Hugging Face `owner/name`) resolve the same way as Pi's main agent: `thinkingmachines/Inkling` becomes `huggingface/thinkingmachines/Inkling` when that id is unique or offered by the current session provider. A first path segment that matches a registered provider still means `provider/id`.
+Registry ids that themselves contain `/` (Hugging Face `owner/name`) resolve the same way as Pi's main agent: `thinkingmachines/Inkling` becomes `huggingface/thinkingmachines/Inkling` when that id is unique or offered by the current session provider. A first path segment that names any provider Pi knows, signed in or not, still means `provider/id`.
 
 ## Model scope enforcement
 
