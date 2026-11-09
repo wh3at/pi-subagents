@@ -96,3 +96,4 @@ top-reasoning model is only a bounded read-only critic after ordinary evidence
 falls short, never an autonomous root. Map tiers to real models in user or
 project settings or a profile (guide `models/setting-defaults-and-overrides`,
 `models/profiles-and-provider-model-catalogs`). Explicit user policy wins.
+Never pick a model from memory.

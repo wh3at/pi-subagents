@@ -6,6 +6,33 @@
 
 - Reviewers can inspect local committed ranges with `watchdog_diff({ baseRef: "main" })` without shell access or a parent-generated artifact. Refs are pinned, the merge base is explicit, and working-tree changes, external diff/textconv programs, and lazy object fetching are excluded.
 
+## [0.87.0] - 2026-11-07
+
+### Highlights
+
+- You can stop a long workflow without losing the work already in progress: `stop` with `drain: true` starts nothing new, lets running children finish and keeps their results.
+- A model written as `provider/id` now always runs on that provider, so a subagent can no longer quietly run on, and bill, another provider's copy of the model.
+- One setting, `subagents.defaultInheritGlobalContext: true`, gives every subagent your global `AGENTS.md`.
+- Old artifacts in nested folders are now cleaned up too, so session artifact folders stop growing.
+- Several multi-window and multi-session fixes: wait notices reach the right window, and closing one session in a host like pi-web no longer stops another session's subagents.
+
+### Added
+
+- `stop` with `drain: true` ends an async workflow without killing the children already running: it starts no new children, lets the running ones finish and report, then ends as stopped. Before, stopping a workflow killed them too. Thanks to [@nnayr](https://github.com/nnayr) for the report. (#3202)
+- `subagents.defaultInheritGlobalContext: true` gives every subagent your global `~/.pi/agent/AGENTS.md`, without listing each agent in `agentOverrides`. An agent that sets `inheritGlobalContext: false` still opts out. Thanks to [@imagebuilder1837](https://github.com/imagebuilder1837) for the report. (#3206)
+
+### Fixed
+
+- A subagent model written as `provider/id` now always runs on that provider. Before, if you were not signed in to that provider, a similar model from another provider (for example OpenRouter's copy of an Anthropic model) could run instead and bill that account. The launch now fails with an error that names the other provider's model, so you can choose it on purpose. The bundled skill also tells the parent to leave `model` out unless you or your settings name one. Thanks to [@crusaderky](https://github.com/crusaderky) for the report. (#3203)
+- When a `parallel` workflow, `tasks` or `chain` item has a field it does not accept, the error now says how to keep what that field asked for. For `output`, it explains that `output` on the outer call writes one file per child, and that exact per-child paths need a workflow script with `runs.all`. For fields such as `worktree`, the error points to the outer call and says that no child was launched. Thanks to [@cash-flow-king](https://github.com/cash-flow-king) for the report. (#3207)
+- `validate` now catches a `runs.lanes` lane that starts by resuming a finished run. It reports the same error the launch would give, so the script can be fixed before it runs. (#3210)
+- `mcp:` selectors now resolve for pi-mcp-adapter servers that set `directTools: "search"` or use `${NAME:-default}` in their configuration. Before, pi-subagents dropped a `"search"` server from the configuration, and a `${NAME:-default}` value gave a server a different cache hash than the adapter computed. In both cases, every selector for the server was unresolved. A server URL that used a default also failed the launch. Thanks to [@acolomba](https://github.com/acolomba) for #3201.
+- In a host that runs several Pi sessions in one process, such as pi-web, closing one session no longer stops subagents that another session started. Thanks to [@Jarcis-cy](https://github.com/Jarcis-cy) for #3204.
+- When two Pi windows have the same session open, a background wait notice now reaches the window that asked for it, instead of whichever window checked first. If that window has closed, the next window that opens the session takes the notice over. Thanks to [@mdrkrg](https://github.com/mdrkrg) for #3205.
+- Old subagent artifacts in nested folders, such as workflow child outputs under `outputs/`, are now removed after `artifactConfig.cleanupDays` like top-level ones. Before, cleanup only looked at the top level, so session artifact folders kept growing. Worktree handoff records and their patches are kept. (#3217)
+- The configuration docs now explain how to turn on delegation in a session that was recorded before pi-subagents was installed. They also no longer say that `"toolActivation": "eager"` makes `subagent` active in every resumed session. Thanks to [@dapp-whisperer](https://github.com/dapp-whisperer) for #3218.
+- On a Pi 1.5 install that is missing `@earendil-works/pi-schema` (seen in a NixOS package), a background subagent launch now fails right away with an error that names the missing package. Before, the launch was accepted and the child then exited with `Cannot find module '@earendil-works/pi-schema'` before its first turn. Thanks to [@Hifive55555](https://github.com/Hifive55555) for #3220.
+
 ## [0.86.0] - 2026-11-05
 
 ### Highlights

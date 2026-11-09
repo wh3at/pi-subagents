@@ -33,7 +33,7 @@ import { handleWatchdogToolAction, WATCHDOG_TOOL_ACTIONS } from "../../watchdog/
 import type { MainWatchdogRuntime } from "../../watchdog/runtime.ts";
 import { applyWatchdogLaunchRules } from "../../watchdog/rules.ts";
 import { childWatchdogProgressForModel } from "../../watchdog/child-status.ts";
-import { normalizeParentModel, resolveEffectiveSubagentModel, resolveModelOrigin, resolveModelSelection, scopedModelIdsFromContext, type ModelOrigin, type ParentModel } from "../shared/model-resolution.ts";
+import { knownModelProviders, normalizeParentModel, resolveEffectiveSubagentModel, resolveModelOrigin, resolveModelSelection, scopedModelIdsFromContext, type KnownProviders, type ModelOrigin, type ParentModel } from "../shared/model-resolution.ts";
 import { projectChainOutputSchemas, resolveEffectiveOutputSchema } from "../shared/child-launch-plan.ts";
 import { formatRetainedChildren, listRetainedChildren } from "../background/retained-children.ts";
 import { resolveModelScopesForAgent, type ModelScopeConfig } from "../shared/model-scope.ts";
@@ -317,6 +317,7 @@ export interface SubagentParamsLike {
 	index?: number;
 	toolCallId?: string;
 	childId?: string;
+	drain?: boolean;
 	view?: "fleet" | "transcript";
 	lines?: number;
 	topic?: string;
@@ -1445,6 +1446,7 @@ function appendStepToAsyncChain(input: {
 		parentProviderRegistry: input.ctx.modelRegistry,
 		currentModel: parentModel,
 		scopedModelIds: scopedModelIdsFromContext(input.ctx),
+		knownProviders: knownModelProviders(input.ctx.modelRegistry),
 		modelScope: discoveredForAppend.modelScope,
 		modelResponseAliases: input.deps.config.modelResponseAliases,
 		interactive: input.ctx.hasUI,
@@ -1914,6 +1916,7 @@ async function resumeExternalJobFollowUp(input: {
 			parentProviderRegistry: input.ctx.modelRegistry,
 			currentModel: parentModel,
 			scopedModelIds: scopedModelIdsFromContext(input.ctx),
+			knownProviders: knownModelProviders(input.ctx.modelRegistry),
 			modelScope: input.modelScope,
 			modelResponseAliases: input.deps.config.modelResponseAliases,
 			interactive: input.ctx.hasUI,
@@ -2219,6 +2222,7 @@ async function resumeAsyncRun(input: {
 				parentProviderRegistry: input.ctx.modelRegistry,
 				currentModel: parentModel,
 				scopedModelIds: scopedModelIdsFromContext(input.ctx),
+				knownProviders: knownModelProviders(input.ctx.modelRegistry),
 				modelScope,
 				modelResponseAliases: input.deps.config.modelResponseAliases,
 				runnerLaunchers: input.deps.config.runnerLaunchers,
@@ -2361,6 +2365,7 @@ async function resumeAsyncRun(input: {
 			parentProviderRegistry: input.ctx.modelRegistry,
 			currentModel: parentModel,
 			scopedModelIds: scopedModelIdsFromContext(input.ctx),
+			knownProviders: knownModelProviders(input.ctx.modelRegistry),
 			modelScope,
 			// Absence in the retained contract is meaningful; never acquire current aliases.
 			modelResponseAliases: recoveryDescriptor ? recoveryDescriptor.modelResponseAliases : foregroundContract?.modelResponseAliases,
@@ -3293,6 +3298,7 @@ function resolveStaticLaunchSummary(input: {
 	parentModel?: ParentModel;
 	scopedModelIds?: string[];
 	availableModels: ModelInfo[];
+	knownProviders: KnownProviders;
 	currentProvider?: string;
 	modelScope?: ModelScopeConfig;
 	thinkingOverrideForTask: ThinkingOverrideForTask;
@@ -3308,7 +3314,7 @@ function resolveStaticLaunchSummary(input: {
 			input.parentModel,
 			input.availableModels,
 			agentConfig?.modelProvider ?? input.currentProvider,
-			modelScopes.length === 0 ? {} : { scope: modelScopes },
+			{ scope: modelScopes, knownProviders: input.knownProviders },
 		);
 	const thinkingOverride = externalRunner ? undefined : input.thinkingOverrideForTask();
 	const thinking = externalRunner ? undefined : resolveEffectiveThinking(model, thinkingOverride ?? agentConfig?.thinking);
@@ -3325,6 +3331,7 @@ function collectStaticLaunchSummaries(input: {
 	parentModel?: ParentModel;
 	scopedModelIds?: string[];
 	availableModels: ModelInfo[];
+	knownProviders: KnownProviders;
 	currentProvider?: string;
 	modelScope?: ModelScopeConfig;
 	thinkingOverrideForTask: ThinkingOverrideForTask;
@@ -3338,6 +3345,7 @@ function collectStaticLaunchSummaries(input: {
 		parentModel: input.parentModel,
 		scopedModelIds: input.scopedModelIds,
 		availableModels: input.availableModels,
+		knownProviders: input.knownProviders,
 		currentProvider: input.currentProvider,
 		modelScope: input.modelScope,
 		thinkingOverrideForTask: input.thinkingOverrideForTask,
@@ -3650,6 +3658,7 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		parentProviderRegistry: ctx.modelRegistry,
 		currentModel: parentModel,
 		scopedModelIds: data.scopedModelIds,
+		knownProviders: knownModelProviders(ctx.modelRegistry),
 		modelScope: data.modelScope,
 		modelResponseAliases: deps.config.modelResponseAliases,
 		runnerLaunchers: deps.config.runnerLaunchers,
@@ -3696,8 +3705,9 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		const modelOverride = a.runner?.type === "external-cli" || a.runner?.type === "external-job"
 			? params.model ?? (externalRunnerWithoutExplicitModel ? undefined : a.model)
 			: resolveEffectiveSubagentModel(params.model as string | undefined, a.model, parentModel, availableModels, a.modelProvider ?? currentProvider, {
-				...(modelScopes.length === 0 ? {} : { scope: modelScopes }),
+				scope: modelScopes,
 				source: modelOrigin === "explicit" ? "explicit" : "inherited",
+				knownProviders: asyncCtx.knownProviders,
 			});
 		const modelOverrideFromParent = modelOrigin === "inherited";
 		const launchRuleError = applyWatchdogLaunchRules({ cwd: effectiveCwd, agent: a.name, model: modelOverride ?? (parentModel && `${parentModel.provider}/${parentModel.id}`), warn: (violation) => deps.watchdog?.displayRuleWarning(violation) });
@@ -4220,6 +4230,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	const parentModel = data.parentModel;
 	const currentProvider = parentModel?.provider;
 	const availableModels: ModelInfo[] = ctx.modelRegistry.getAvailable().map(toModelInfo);
+	const knownProviders = knownModelProviders(ctx.modelRegistry);
 	const modelScopes = resolveModelScopesForAgent(data.modelScope, agentConfig.name, parentModel, data.scopedModelIds);
 	let task = typeof params.task === "string" ? params.task : "";
 	const modelOrigin = resolveModelOrigin({
@@ -4235,8 +4246,9 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		availableModels,
 		agentConfig.modelProvider ?? currentProvider,
 		{
-			...(modelScopes.length === 0 ? {} : { scope: modelScopes }),
+			scope: modelScopes,
 			source: modelOrigin === "explicit" ? "explicit" : "inherited",
+			knownProviders,
 		},
 	);
 	const modelOverrideFromParent = modelOrigin === "inherited";
@@ -4488,6 +4500,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			thinkingCeiling: agentConfig.maxThinking,
 			extensionBindings: params.extensionBindings,
 			availableModels,
+			knownProviders,
 			modelResponseAliases,
 			preferredModelProvider: currentProvider,
 			modelScope: modelScopes,
@@ -5777,7 +5790,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				const completionOwnerId = deps.state.completionOwnerId ?? currentCompletionOwnerId();
 				deps.state.completionOwnerId = completionOwnerId;
 				const workflowScriptSourceDigest = workflowScriptDigest(requestParams.workflowScript);
-				const workflowRunEvidence: Pick<NonNullable<AsyncStatus["workflow"]>, "args" | "argsDigest" | "scriptDigest" | "reusedFrom" | "stopCause" | "resumeOrigin"> = { ...workflowArgsEvidence, scriptDigest: workflowScriptSourceDigest };
+				const workflowRunEvidence: Pick<NonNullable<AsyncStatus["workflow"]>, "args" | "argsDigest" | "scriptDigest" | "reusedFrom" | "stopCause" | "resumeOrigin" | "drainRequestedAt"> = { ...workflowArgsEvidence, scriptDigest: workflowScriptSourceDigest };
 				if (workflowReuseSource) workflowRunEvidence.reusedFrom = workflowReuseSource.runId;
 				// In the first persisted status, before any child launches, so a later resume can count attempts.
 				if (workflowResumeLaunch) workflowRunEvidence.resumeOrigin = workflowResumeLaunch.resumeOrigin;
@@ -5812,6 +5825,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				const controller = new AbortController();
 				deps.state.workflowControllers ??= new Map();
 				deps.state.workflowChildStops ??= new Map();
+				deps.state.workflowDrains ??= new Map();
 				deps.state.workflowControllers.set(workflowRunId, controller);
 				workflowCapacity?.markWorkflowStarted();
 				if (workflowCapacity) deps.state.activeAsyncCapacity = getActiveAsyncCapacitySnapshot(currentSessionId, resolveMaxActiveAsyncRunsPerSession(deps.config.maxActiveAsyncRunsPerSession), { liveWorkflowRunIds: new Set(deps.state.workflowControllers.keys()), abandonedSlotReleaseAfterMs: resolveAbandonedSlotReleaseAfterMs(deps.config.capacity?.abandonedSlotReleaseAfterMs) });
@@ -6382,6 +6396,33 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 								if (stop) deps.state.workflowChildStops?.set(workflowRunId, stop);
 								else deps.state.workflowChildStops?.delete(workflowRunId);
 							},
+							registerDrain: (drain) => {
+								if (!drain) deps.state.workflowDrains?.delete(workflowRunId);
+								else deps.state.workflowDrains?.set(workflowRunId, () => {
+									if (workflowRunEvidence.drainRequestedAt === undefined) {
+										// The marker must be on disk before anything is stopped: without it a reload during the drain would resume the run.
+										const previousWorkflow = status.workflow;
+										workflowRunEvidence.drainRequestedAt = Date.now();
+										status.workflow = { ...(previousWorkflow ?? { trace: [], emits: [], console: [] }), drainRequestedAt: workflowRunEvidence.drainRequestedAt };
+										let saved = false;
+										try {
+											persist();
+											saved = runPersistence.pendingCount() === 0;
+										} catch (error) {
+											console.error(`Failed to save the drain request for async workflow '${workflowRunId}':`, error);
+										}
+										if (!saved) {
+											delete workflowRunEvidence.drainRequestedAt;
+											status.workflow = previousWorkflow;
+											// Replaces a queued write that still carries the marker.
+											persist({ tolerateStatusWriteFailure: true });
+											return { ok: false };
+										}
+									}
+									// Deferred so a full stop that stops the last running child aborts with its own reason first.
+									return { ok: true, started: drain(() => queueMicrotask(() => controller.abort(new Error("Workflow drained: started children finished; no new children were started.")))) };
+								});
+							},
 							...(workflowState ? { state: workflowState } : {}),
 							onTrace: updateTrace,
 							onChildSettled: (notification) => {
@@ -6690,8 +6731,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			const workflowOutput = typeof workflowChildDefaults.output === "string" || typeof workflowChildDefaults.output === "boolean" ? workflowChildDefaults.output : undefined;
 			const configuredOutputBaseDir = resolveConfiguredSingleRunOutputBaseDir(deps);
 			const workflowAggregateOutputPath = resolveSingleOutputPath(workflowOutput, ctx.cwd, workflowCwd, resolveSingleRunOutputBaseDir(deps, workflowArtifactsDir, foregroundWorkflowRunId));
-			// A top-level artifact file: outside outputs/, where children save their reports, and
-			// within artifact retention, which only removes top-level files.
+			// Outside outputs/ so it cannot overwrite a child's report.
 			const workflowFullResultPath = path.join(workflowArtifactsDir, `${sanitizeRunPathSegment(foregroundWorkflowRunId)}_workflow-result.md`);
 			const claimedOutputPaths = new Map<string, string>();
 			const childOutputOverrides = new Map<string, string>();
@@ -7514,6 +7554,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			}
 			if (action === "stop") {
 				const targetRunId = paramsWithResolvedCwd.runId ?? paramsWithResolvedCwd.id;
+				if (paramsWithResolvedCwd.drain && paramsWithResolvedCwd.childId !== undefined) return { content: [{ type: "text", text: "action='stop' drain applies to a whole workflow; omit childId." }], isError: true, details: { mode: "management", results: [] } };
 				// Whole-workflow stops reach stopAsyncRun below, which stops a live workflow in-process.
 				const workflowRunId = targetRunId && paramsWithResolvedCwd.childId !== undefined ? resolveLiveWorkflowRunId(deps, targetRunId) : undefined;
 				if (workflowRunId && paramsWithResolvedCwd.childId !== undefined) {
@@ -7553,7 +7594,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				if (paramsWithResolvedCwd.dir) {
 					try {
 						const location = resolveAsyncRunLocation(paramsWithResolvedCwd, DIRS.async, DIRS.results);
-						const stopResult = stopAsyncRun(deps.state, location.resolvedId ?? targetRunId ?? path.basename(location.asyncDir ?? paramsWithResolvedCwd.dir), deps.kill, location, paramsWithResolvedCwd.childId);
+						const stopResult = stopAsyncRun(deps.state, location.resolvedId ?? targetRunId ?? path.basename(location.asyncDir ?? paramsWithResolvedCwd.dir), deps.kill, location, paramsWithResolvedCwd.childId, paramsWithResolvedCwd.drain);
 						return stopResult ?? { content: [{ type: "text", text: `No running or queued async run was found for '${targetRunId ?? paramsWithResolvedCwd.dir}'.` }], isError: true, details: { mode: "management", results: [] } };
 					} catch (error) {
 						const text = error instanceof Error ? error.message : String(error);
@@ -7575,6 +7616,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					deps.kill,
 					resolved?.kind === "async" ? resolved.location : undefined,
 					paramsWithResolvedCwd.childId,
+					paramsWithResolvedCwd.drain,
 				);
 				if (stopResult) return stopResult;
 				return {
@@ -8150,6 +8192,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					parentModel: requestParentModel,
 					scopedModelIds: scopedModelIdsFromContext(ctx),
 					availableModels: ctx.modelRegistry.getAvailable().map(toModelInfo),
+					knownProviders: knownModelProviders(ctx.modelRegistry),
 					currentProvider: requestParentModel?.provider,
 					modelScope,
 					thinkingOverrideForTask,

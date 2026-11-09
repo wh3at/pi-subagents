@@ -1539,6 +1539,8 @@ export interface Details {
 		ownerExitedAt?: number;
 		/** Set on a run that resumes an interrupted one; `attempt` counts resumes that followed Pi exits. */
 		resumeOrigin?: { sourceRunId: string; attempt: number };
+		/** When `stop` with `drain` was requested (epoch ms). A drained run is never resumed. */
+		drainRequestedAt?: number;
 		resource?: WorkflowResourceProvenance;
 		preflightWarnings?: string[];
 		trace: Array<{
@@ -2335,6 +2337,10 @@ export interface WaitSubscriptionRecord {
 	version: 1;
 	token: string;
 	sessionId: string;
+	/** Completion owner of the process that armed the record. A record without it stays scoped to the session. */
+	completionOwnerId?: string;
+	/** The Pi process behind `completionOwnerId`. Once it is dead, the next process on the session takes the wake. */
+	completionOwnerProcess?: RecordedPid;
 	targetKind: "async" | "foreground";
 	runId: string;
 	requestedId: string;
@@ -2416,6 +2422,8 @@ export interface SubagentState {
 	workflowControllers?: Map<string, AbortController>;
 	/** Live in-process workflow child stoppers keyed by parent workflow run id. */
 	workflowChildStops?: Map<string, (childId: string, message?: string) => boolean>;
+	/** Live in-process workflow drains keyed by workflow run id; `ok: false` means the drain request could not be saved and nothing was stopped. */
+	workflowDrains?: Map<string, () => { ok: true; started: number } | { ok: false }>;
 	/** Background children awaited by a blocking workflow call: their parent cannot answer supervisor asks. */
 	blockingWorkflowChildren?: Set<string>;
 }
@@ -2602,6 +2610,7 @@ export interface RunSyncOptions {
 	workflowChildPermitLaunch?: WorkflowChildPermitContext;
 	/** Registry models available for heuristic bare-model resolution */
 	availableModels?: Array<{ provider: string; id: string; fullId: string; contextWindow?: number }>;
+	knownProviders?: import("../runs/shared/model-resolution.ts").KnownProviders;
 	modelResponseAliases?: Record<string, string[]>;
 	/** Current parent-session provider to prefer for ambiguous bare model ids */
 	preferredModelProvider?: string;
