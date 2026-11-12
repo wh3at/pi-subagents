@@ -6,6 +6,38 @@
 
 - Reviewers can inspect local committed ranges with `watchdog_diff({ baseRef: "main" })` without shell access or a parent-generated artifact. Refs are pinned, the merge base is explicit, and working-tree changes, external diff/textconv programs, and lazy object fetching are excluded.
 
+## [0.88.0] - 2026-11-10
+
+### Highlights
+
+- The widget and `status` now show the latest progress a running child reported, with how long ago it reported.
+- A child waiting for your answer no longer runs out its `timeoutMs` while it waits, and a reply cut off at the model's output limit now fails instead of passing as a success.
+- Forked subagents stop filling the disk: their copies of the parent session are deleted once they go unused for `cleanupDays`.
+- Big agent catalogs stay small in the conversation: `list` shows at most 30 agents and has a `search` filter.
+- Fixes for pi Desktop workflow scripts, Windows machines that block PowerShell, disabled MCP servers, and gateways that require a prompt cache key.
+
+### Added
+
+- The subagent widget shows the latest progress a running child reported with `contact_supervisor` (`progress_update`), with how long ago it reported, and `status` lists it on the child's line. Before, the report text was not shown anywhere in the parent. Thanks to [@kodfodrasz](https://github.com/kodfodrasz) for #3230.
+- `{ action: "list" }` takes an `options.search` filter that matches agent names, descriptions and aliases. Thanks to [@peskycipher](https://github.com/peskycipher) for the report. (#3225)
+
+### Fixed
+
+- A run's remaining `timeoutMs` budget no longer changes when the system clock is adjusted. Before, setting the clock back or forward during a run could add that much time to the budget or end the run early. Thanks to [@Osraka](https://github.com/Osraka) for #3247.
+- A subagent run's `timeoutMs` no longer counts the time a child spends waiting for its supervisor to answer a `contact_supervisor` decision or interview, or an `intercom` ask. Before, a child that asked late in a run could time out while it waited, and the run was reported as failed even though the child did the right thing. Thanks to [@adrian-ludwig](https://github.com/adrian-ludwig) for #3228.
+- A subagent whose final reply was cut off at the model's maximum output length now fails with "Response was truncated: the model reached its maximum output length." and keeps the partial reply for inspection. Before, the run was reported as a success with the cut-off text as its answer. A run that already returned a valid `structured_output` still succeeds. Thanks to [@adrian-ludwig](https://github.com/adrian-ludwig) for #3226.
+- With `toolActivation: "auto"`, switching models before the first message now picks the subagent tools for the model you switched to. Before, the choice was made for the startup model, so a session that switched to a model that can't add tools mid-conversation kept the loader, and calling it later made the provider miss its prompt cache. Thanks to [@IdrisGit](https://github.com/IdrisGit) for #3241.
+- A subagent's final acceptance report now reaches the parent intact. Before, a steer or follow-up queued while the child was finishing started another turn after the report, and the parent received that turn's text instead of the report. A steer the child rejects now stays rejected until you resume the child, instead of the child being restarted automatically. Thanks to [@adrian-ludwig](https://github.com/adrian-ludwig) for #3227.
+- The bundled `undici` dependency is now 8.12.4, which fixes the security advisories published against 8.12.3 (cache and redirect information disclosure, credential stripping, a skipped integrity check, and an uncaught exception). Thanks to [@dzervas](https://github.com/dzervas) for the report. (#3242)
+- On Windows machines where policy blocks `powershell.exe`, the cleanup of old background subagent state now finishes. Before, it stopped with `spawn UNKNOWN` and printed the error over the footer every session. A cleanup failure now shows as a warning in Pi instead of raw text over the screen. Thanks to [@SuperSalsa20](https://github.com/SuperSalsa20) for the report. (#3240)
+- Subagents now skip `mcp:` selectors for pi-mcp-adapter servers explicitly configured with `disabled: true`. Before, a disabled server could prevent a child from launching. Unknown servers and enabled servers without matching cached tools still fail the launch. Thanks to [@shura-v](https://github.com/shura-v) for #3238.
+- Workflow scripts start on hosts that run Pi on Electron, such as pi Desktop. Before, Electron left the sandbox flags in the script process's arguments and every workflow script failed with `Cannot find module '--allow-worker'`. Thanks to [@hotsnow-sean](https://github.com/hotsnow-sean) for #3222.
+- A forked subagent (`context: "fork"`) launched in another folder than the parent session now gets that folder's `AGENTS.md` / `CLAUDE.md`. Before, it kept only the parent's project instructions, so a fork started in a repository worktree never saw the repository's `AGENTS.md`.
+- The copies of the parent session that forked subagents write under `<parent session>/forks/` are now deleted once nothing has written to them for `artifactConfig.cleanupDays` (default 7) and their run is no longer active. Before, nothing deleted them; one parent session of about 400 MB filled 22 GB in a day with 57 forks. Resuming a child whose copy was deleted now says so. (#3232)
+- `{ action: "list" }` now shows at most 30 agents and points to `options.search` for the rest. Before, it printed every agent with its full description, so a catalog of a few hundred agents put about 160 KB into the conversation in one call.
+- In a non-interactive session (`pi -p`), Pi now waits for background subagent work at the end of a turn for as long as the `timeoutMs` setting allows a run to take. Before, it always gave up after 30 minutes, so a parent that ended its turn to wait for a longer child failed and exited before the child's result arrived. Without `timeoutMs`, the wait is still 30 minutes. Thanks to [@mt-huerta](https://github.com/mt-huerta) for #3229.
+- The Watchdog's own model requests (reviews and permission decisions) and Prompt Audit's task rewrite now carry the parent session id, so providers that key prompt caching on it get a `prompt_cache_key`. Before, a gateway that requires one rejected every Watchdog review with HTTP 400. Thanks to [@hetingyi](https://github.com/hetingyi) for #3223.
+
 ## [0.87.0] - 2026-11-07
 
 ### Highlights

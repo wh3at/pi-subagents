@@ -229,6 +229,12 @@ function validateConfig(config: Record<string, unknown>): void {
 	validateRunnerLaunchersConfig(config.runnerLaunchers);
 }
 
+// An invalid value counts as unset; above Node's timer ceiling a timer fires almost at once.
+export function resolveConfigDefaultTimeoutMs(raw: unknown): number | undefined {
+	if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0 || raw > 2_147_483_647) return undefined;
+	return raw;
+}
+
 export function getConfigPath(): string {
 	return path.join(getAgentDir(), "extensions", "subagent", "config.json");
 }

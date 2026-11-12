@@ -84,6 +84,18 @@ function createRuntime(messages: any[] = [], excluded: string[] = [], missingApi
 		handlers, tools, context,
 		active: () => [...activeNames],
 		select: (names: string[]) => { activeNames = [...names]; },
+		// Pi sets the model before model_select. `idle: false`: the switch happens during a run.
+		async switchModel(next: unknown, idle = true) {
+			const previousModel = context.model;
+			context.model = next;
+			const isIdle = context.isIdle;
+			context.isIdle = () => idle;
+			try {
+				for (const handler of handlers.get("model_select") ?? []) await handler({ type: "model_select", model: next, previousModel, source: "set" }, context);
+			} finally {
+				context.isIdle = isIdle;
+			}
+		},
 		async emit(name: string, event: any) {
 			for (const handler of handlers.get(name) ?? []) await handler(event, context);
 		},
@@ -211,12 +223,14 @@ const system = { supportsMidConvoSystemMessages: true };
 const COMPATIBLE = model("anthropic-messages", { ...system, supportsMidConvoToolChanges: true });
 const INCOMPATIBLE = model("openai-completions", { supportsMidConvoToolAdditions: true });
 
-async function startAgent(runtime: ReturnType<typeof createRuntime>): Promise<string[]> {
+// `sent: false`: the run failed before its first request, so no agent_start.
+async function startAgent(runtime: ReturnType<typeof createRuntime>, sent = true): Promise<string[]> {
 	const event = {
 		type: "before_agent_start", prompt: "continue", systemPrompt: "base",
 		systemPromptOptions: { selectedTools: runtime.active(), sections: {}, promptGuidelines: [] },
 	};
 	await runtime.emit("before_agent_start", event);
+	if (sent) await runtime.emit("agent_start", { type: "agent_start" });
 	return event.systemPromptOptions.selectedTools;
 }
 
@@ -262,9 +276,51 @@ describe("toolActivation modes", () => {
 			assert.ok(first.includes("subagent") && first.includes("read"));
 			assert.equal(first.includes("subagents_enable"), false);
 			// Switching to a capable model mid-session changes nothing.
-			runtime.context.model = COMPATIBLE;
+			await runtime.switchModel(COMPATIBLE);
 			assert.deepEqual(await startAgent(runtime), first);
 		}
+	});
+
+	it("decides a new auto session with the model chosen before the first prompt", async () => {
+		const cases: Array<[typeof COMPATIBLE, typeof COMPATIBLE, boolean]> = [[COMPATIBLE, INCOMPATIBLE, false], [INCOMPATIBLE, COMPATIBLE, true]];
+		for (const event of [{ type: "session_start", reason: "startup" }, RESUME]) {
+			for (const [startModel, firstModel, loader] of cases) {
+				const runtime = createRuntime([], [], [], { model: startModel });
+				await runtime.emit(event.type, event);
+				await runtime.switchModel(firstModel);
+				const first = await startAgent(runtime);
+				const label = `${event.reason}, ${firstModel.api}`;
+				assert.equal(first.includes("subagents_enable"), loader, `${label}: loader`);
+				for (const name of ["subagent", "contact_supervisor", "bg_wait", "subagent_supervisor"]) assert.equal(first.includes(name), !loader, `${label}: ${name}`);
+				await runtime.switchModel(startModel);
+				assert.deepEqual(await startAgent(runtime), first, `${label}: after the first request`);
+			}
+		}
+
+		const started = async () => {
+			const runtime = createRuntime([], [], [], { model: COMPATIBLE });
+			await runtime.emit("session_start", { type: "session_start", reason: "startup" });
+			return runtime;
+		};
+		const failed = await started();
+		await startAgent(failed, false);
+		await failed.switchModel(INCOMPATIBLE);
+		assert.ok((await startAgent(failed)).includes("subagent"), "retry after a failed first run");
+
+		const chosen = await started();
+		chosen.select(["read"]);
+		await chosen.switchModel(INCOMPATIBLE);
+		assert.equal((await startAgent(chosen)).includes("subagent"), false, "manual choice");
+
+		const running = await started();
+		await running.switchModel(INCOMPATIBLE, false);
+		assert.equal((await startAgent(running)).includes("subagent"), false, "switch during a run");
+
+		const recorded = createRuntime([compacted], [], [], { model: COMPATIBLE });
+		await recorded.emit(RESUME.type, RESUME);
+		await recorded.switchModel(INCOMPATIBLE);
+		const next = await startAgent(recorded);
+		assert.ok(next.includes("subagents_enable") && !next.includes("subagent"), "recorded");
 	});
 
 	it("offers the loader in auto only when the model's API can add tools mid-conversation", async () => {
@@ -659,6 +715,12 @@ describe("toolActivation modes", () => {
 			runtime.select(["read", "subagents_enable", "bg_wait"]);
 			await runtime.emit("session_tree", { type: "session_tree", newLeafId: null, oldLeafId: null });
 			assert.ok(runtime.active().includes("subagent_supervisor"), "branch switch while a reply is owed");
+
+			const fresh = createRuntime([], [], [], { model: INCOMPATIBLE });
+			await fresh.emit("session_start", { type: "session_start", reason: "startup" });
+			await fresh.switchModel(COMPATIBLE);
+			const first = await startAgent(fresh);
+			assert.ok(first.includes("subagents_enable") && first.includes("subagent_supervisor"), "switched before the first prompt");
 		} finally {
 			fs.rmSync(channelDir, { recursive: true, force: true });
 		}
