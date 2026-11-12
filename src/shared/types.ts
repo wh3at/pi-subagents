@@ -742,6 +742,8 @@ export interface ScheduleOrigin {
 export type SteeringActionState = "delivered" | "scheduled" | "pending" | "partial" | "recovered" | "failed";
 export type SteeringTargetState = "scheduled" | "pending" | "routed" | "queued" | "delivered" | "late" | "failed" | "recovered";
 
+export type SteeringFailureKind = "rejected" | "unconsumed";
+
 export interface SteeringTargetStatus {
 	index: number;
 	state: SteeringTargetState;
@@ -750,6 +752,7 @@ export interface SteeringTargetStatus {
 	lateDeliveredAt?: number;
 	failedAt?: number;
 	recoveredAt?: number;
+	failureKind?: SteeringFailureKind;
 	reason?: string;
 	replacementRunId?: string;
 }
@@ -777,6 +780,7 @@ export interface SteeringStatus {
 export interface SteerActionTarget {
 	index: number;
 	state: SteeringTargetState;
+	failureKind?: SteeringFailureKind;
 	deliveredAt?: number;
 	lateDeliveredAt?: number;
 	reason?: string;
@@ -975,6 +979,8 @@ export interface AgentProgress {
 	/** Human-readable display name for the child's session, when derived at launch. */
 	sessionName?: string;
 	status: "pending" | "running" | "completed" | "failed" | "detached";
+	progressText?: string;
+	progressUpdatedAt?: number;
 	activityState?: ActivityState;
 	task: string;
 	skills?: string[];
@@ -1625,6 +1631,8 @@ export interface NestedStepSummary {
 	/** Human-readable display name for the child session, when derived at launch. */
 	sessionName?: string;
 	status: "pending" | "running" | "complete" | "completed" | "failed" | "partial" | "paused" | "stopped" | "rejected";
+	progressText?: string;
+	progressUpdatedAt?: number;
 	model?: string;
 	thinking?: string;
 	sessionFile?: string;
@@ -2042,6 +2050,8 @@ export interface AsyncStatus {
 		currentPath?: string;
 		recentTools?: Array<{ tool: string; args: string; endMs: number }>;
 		recentOutput?: string[];
+		progressText?: string;
+		progressUpdatedAt?: number;
 		turnCount?: number;
 		toolCount?: number;
 		startedAt?: number;

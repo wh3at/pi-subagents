@@ -5,13 +5,23 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import { DIRS, type AsyncStatus } from "../../src/shared/types.ts";
-import { createEventBus, makeAgent, makeMinimalCtx } from "../support/helpers.ts";
+import { createEventBus, events, makeAgent, makeMinimalCtx } from "../support/helpers.ts";
 import { available, createSubagentExecutor, installSingleExecutionHooks, makeExecutor, mockPi, readAllCallArgs, tempDir } from "../support/single-execution-fixture.ts";
 
 const DISABLED = { disabledFeatures: ["workflow-scripts"] };
 
 function text(result: { content: Array<{ type: string; text?: string }> }): string {
 	return result.content.map((part) => part.text ?? "").join("\n");
+}
+
+async function readStatusUntil(statusPath: string, done: (status: AsyncStatus) => boolean): Promise<AsyncStatus | undefined> {
+	let status: AsyncStatus | undefined;
+	for (let attempt = 0; attempt < 250; attempt += 1) {
+		if (fs.existsSync(statusPath)) status = JSON.parse(fs.readFileSync(statusPath, "utf8")) as AsyncStatus;
+		if (status && done(status)) break;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	return status;
 }
 
 describe("structured chain/tasks workflows", { skip: !available || !createSubagentExecutor ? "pi packages not available" : undefined }, () => {
@@ -80,6 +90,34 @@ describe("structured chain/tasks workflows", { skip: !available || !createSubage
 		assert.equal(readAllCallArgs().length, 2, "the step after the failure does not launch");
 	});
 
+	it("persists reported progress from a foreground child in an async workflow", async () => {
+		const release = path.join(tempDir, "workflow-progress-child-release");
+		fs.rmSync(release, { force: true });
+		mockPi.onCall({ steps: [
+			{ jsonl: [events.toolStart("contact_supervisor", { reason: "progress_update", message: "[1/1] Child progress" }), events.toolResult("contact_supervisor", "Progress recorded")] },
+			{ waitForPath: release, jsonl: [events.assistantMessage("Child complete")] },
+		] });
+		const executor = makeExecutor([makeAgent("scout")], {}, false, undefined, true, new Map(), undefined, undefined, createEventBus(), undefined, undefined, () => {});
+		const launch = await executor.executePublic("workflow-child-progress", {
+			workflowScript: 'return await runs.run("child", { agent: "scout", task: "Report progress", async: false, acceptance: false, output: false });',
+			async: true,
+		}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(launch.isError, undefined, text(launch));
+		const asyncDir = launch.details.asyncDir;
+		assert.ok(asyncDir);
+		const statusPath = path.join(asyncDir, "status.json");
+		try {
+			const step = (await readStatusUntil(statusPath, (status) => status.steps?.[0]?.progressText === "[1/1] Child progress"))?.steps?.[0];
+			assert.equal(step?.progressText, "[1/1] Child progress");
+			assert.equal(typeof step?.progressUpdatedAt, "number");
+		} finally {
+			fs.writeFileSync(release, "continue");
+			await readStatusUntil(statusPath, (status) => status.state === "complete" || status.state === "failed");
+			fs.rmSync(asyncDir, { recursive: true, force: true });
+			if (launch.details.asyncId) fs.rmSync(path.join(DIRS.results, `${launch.details.asyncId}.json`), { force: true });
+		}
+	});
+
 	it("records a failed state for an async tasks run with a failed child", async () => {
 		mockPi.onCall({ matchArgIncludes: "Task A", output: "A done" });
 		mockPi.onCall({ matchArgIncludes: "Task B", exitCode: 1, stderr: "B broke" });
@@ -92,13 +130,8 @@ describe("structured chain/tasks workflows", { skip: !available || !createSubage
 		assert.equal(launch.isError, undefined, text(launch));
 		assert.ok(launch.details.asyncDir);
 		const statusPath = path.join(launch.details.asyncDir!, "status.json");
-		let status: Partial<Pick<AsyncStatus, "state">> = {};
-		for (let attempt = 0; attempt < 250; attempt += 1) {
-			if (fs.existsSync(statusPath)) status = JSON.parse(fs.readFileSync(statusPath, "utf8"));
-			if (status.state === "complete" || status.state === "failed") break;
-			await new Promise((resolve) => setTimeout(resolve, 20));
-		}
-		assert.equal(status.state, "failed");
+		const status = await readStatusUntil(statusPath, (current) => current.state === "complete" || current.state === "failed");
+		assert.equal(status?.state, "failed");
 		fs.rmSync(launch.details.asyncDir!, { recursive: true, force: true });
 		if (launch.details.asyncId) fs.rmSync(path.join(DIRS.results, `${launch.details.asyncId}.json`), { force: true });
 	});

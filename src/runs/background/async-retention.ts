@@ -15,10 +15,10 @@ import { encodeIndexSegment } from "./index-segment.ts";
 import { reconcileAsyncRun } from "./stale-run-reconciler.ts";
 import { recoveryDescriptorPath, runLaunchDir } from "../shared/run-launch-folder.ts";
 
-export const ASYNC_RETENTION_DAYS = 30;
+const ASYNC_RETENTION_DAYS = 30;
 export const ASYNC_RETENTION_BATCH_SIZE = 100;
 export const ASYNC_RETENTION_DELAY_MS = 60_000;
-export const ASYNC_RETENTION_TOMBSTONE_GRACE_MS = 24 * 60 * 60 * 1000;
+const ASYNC_RETENTION_TOMBSTONE_GRACE_MS = 24 * 60 * 60 * 1000;
 // A run or result whose session file still exists can be resumed, so it is kept this long
 // instead of ASYNC_RETENTION_DAYS. Session files outlive run dirs, so without a ceiling it is kept forever.
 export const RESUMABLE_RETENTION_DAYS = 90;
@@ -378,9 +378,14 @@ async function computeProcessStartIdentity(pid: number): Promise<string | undefi
 	if (process.platform === "win32") {
 		// PowerShell takes ~0.5 s to start; a synchronous spawn would freeze the TUI.
 		const started = await new Promise<string>((resolve) => {
-			execFile("powershell.exe", ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CreationDate`], { encoding: "utf-8", windowsHide: true, timeout: 5_000 }, (error, stdout) => {
-				resolve(error ? "" : stdout.trim());
-			});
+			// Node throws instead of calling back when the executable cannot be spawned at all (spawn UNKNOWN when policy blocks PowerShell).
+			try {
+				execFile("powershell.exe", ["-NoProfile", "-Command", `(Get-CimInstance Win32_Process -Filter "ProcessId=${pid}").CreationDate`], { encoding: "utf-8", windowsHide: true, timeout: 5_000 }, (error, stdout) => {
+					resolve(error ? "" : stdout.trim());
+				});
+			} catch {
+				resolve("");
+			}
 		});
 		return started ? `win:${started}` : undefined;
 	}

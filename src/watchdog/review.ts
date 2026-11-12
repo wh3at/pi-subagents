@@ -222,7 +222,7 @@ export function formatWatchdogCwdSection(cwd: string): string {
 	return `<cwd>\n${cwd}\n</cwd>`;
 }
 
-export function buildWatchdogSystemPrompt(ctx: Pick<ExtensionContext, "cwd">, options: { hasScope?: boolean; guidance?: string; hasDiff?: boolean } = {}): string {
+function buildWatchdogSystemPrompt(ctx: Pick<ExtensionContext, "cwd">, options: { hasScope?: boolean; guidance?: string; hasDiff?: boolean } = {}): string {
 	const guidance = options.guidance?.trim();
 	return [
 		"You are the main-session subagent watchdog for Pi.",
@@ -326,6 +326,7 @@ async function runWatchdogAttempt(ctx: ExtensionContext, request: WatchdogReview
 		hasDiff: diffBaseline !== undefined,
 	});
 	const agent = new Agent({
+		sessionId,
 		initialState: {
 			systemPrompt,
 			model: selection.model,

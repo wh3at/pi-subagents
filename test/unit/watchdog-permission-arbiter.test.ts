@@ -59,9 +59,11 @@ describe("watchdog permission arbiter", () => {
 		const current = model();
 		const calls: TranscriptContext[] = [];
 		const registryModels: Model<any>[] = [];
+		const sessionIds: Array<string | undefined> = [];
 		const providerStream = stream("approve", "registry-owned stream", calls);
 		const registryStream: StreamFn = (nextModel, context, options) => {
 			registryModels.push(nextModel);
+			sessionIds.push(options?.sessionId);
 			return providerStream(nextModel, context, options);
 		};
 		const result = await createWatchdogPermissionArbiter()({
@@ -74,6 +76,7 @@ describe("watchdog permission arbiter", () => {
 		assert.deepEqual(result, { approved: true, reason: "registry-owned stream", source: "watchdog" });
 		assert.equal(calls.length, 2);
 		assert.deepEqual(registryModels, [current, current]);
+		assert.deepEqual(sessionIds, ["watchdog-permission-session", "watchdog-permission-session"]);
 	});
 
 	it("approves and denies exact calls through the watchdog model decision tool", async () => {

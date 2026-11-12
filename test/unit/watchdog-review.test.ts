@@ -170,6 +170,7 @@ describe("main watchdog review adapter", () => {
 
 		await createMainWatchdogReview(context, { streamFn })(request(enabledConfig(), []));
 
+		assert.equal(calls[0]?.options?.sessionId, "watchdog-review-session");
 		assert.deepEqual(calls[0]?.context.messages[0], {
 			role: "system",
 			content: [
