@@ -6,6 +6,24 @@
 
 - Reviewers can inspect local committed ranges with `watchdog_diff({ baseRef: "main" })` without shell access or a parent-generated artifact. Refs are pinned, the merge base is explicit, and working-tree changes, external diff/textconv programs, and lazy object fetching are excluded.
 
+## [0.88.1] - 2026-11-12
+
+### Highlights
+
+- A permission prompt or other dialog that opens while the fleet inspector is up is no longer hidden behind it.
+- Background subagents whose agent has no tool list get your configured MCP tools again, and an extension that registers its own MCP server no longer stops subagents from starting.
+- `status` and `stop` no longer report a cleanly finishing background subagent as having ended without proof.
+- A manual `/compact` no longer wakes an idle parent while background subagents are running.
+
+### Fixed
+
+- The fleet inspector no longer covers a dialog that opens while it is up, such as a permission prompt from another extension or a `select`/`confirm`. The inspector steps aside while the dialog is open and comes back, with the same child selected, when it closes. Before, the dialog sat hidden behind the inspector, so `q` seemed to do nothing and Esc answered the hidden prompt. Thanks to [@imLWY](https://github.com/imLWY) for #3254.
+- Background subagents whose agent doesn't list `tools` now get the direct MCP tools you configured in pi-mcp-adapter, as long as no capability ceiling applies. Agents that only set `excludeTools` keep every tool they don't exclude. Before, these subagents lost all direct MCP tools. Thanks to [@acolomba](https://github.com/acolomba) for #3259.
+- A subagent no longer fails to start when one of its required child extensions registers an MCP server with `pi.registerMcpServer()` and the agent selects no `mcp:` tools. Before, the launch stopped with "Required child extension failed during startup". The subagent now runs and shows Pi's message as a warning in its output; any other startup failure of a required extension still stops the launch. With Pi's built-in MCP, foreground subagents can also select `mcp:` tools from servers their required child extensions register; before, every server an extension registered was refused in the foreground. Thanks to [@NicholasSend](https://github.com/NicholasSend) for #3256.
+- `status` and `stop` no longer report a background subagent's exit as `unknown` (`observer-unavailable`) when they are called in the moment between the subagent saving its result and saving its final status. The run now keeps showing `running` until it finishes. Before, a caller waiting for proof that the run ended could see an unverifiable end for a run that exited cleanly. Thanks to [@Ancienttwo](https://github.com/Ancienttwo) for #3258.
+- An extension that changes a workflow child's `task` in its `tool_call` handler for `subagent_launch` now changes what that child is told. Before, the change was dropped and the child got the original text, although Pi applies such changes for every other tool. This covers workflow scripts, `parallel`, `tasks` and `chain`, including steps built from `{previous}`. Other fields and a resumed child's message still can't be changed.
+- With background subagents running, a manual compaction (`/compact`, RPC `compact` or an extension's `ctx.compact()`) no longer starts a turn when the parent was idle or stopped with Esc. Before, every manual compaction resumed the parent, so an extension that compacts on `agent_settled` made it answer "still waiting" each time. A compaction that interrupts a working parent still resumes it. A subagent result that arrives during a compaction now wakes the parent once the compaction ends, instead of starting a run mid-compaction. Thanks to [@IdrisGit](https://github.com/IdrisGit) for #3253 and [@jyshowalter](https://github.com/jyshowalter) for the report. (#3252)
+
 ## [0.88.0] - 2026-11-10
 
 ### Highlights
