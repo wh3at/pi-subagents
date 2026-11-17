@@ -144,6 +144,20 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.deepEqual({ agent: running?.agent, runId: running?.runId }, { agent: "worker", runId: settledRunId });
 	});
 
+	it("names a running foreground workflow child's session file from launch", async () => {
+		mockPi.onCall({ matchArgIncludes: "Child A", delay: 300, output: "A done" });
+		const updates: any[] = [];
+		const result = await makeExecutor([makeAgent("worker")]).execute("wf-launch-session-file", {
+			workflowScript: `return await runs.run("a", { agent: "worker", task: "Child A", async: false });`,
+			async: false, chatProgress: "off",
+		}, undefined, (update) => updates.push(structuredClone(update.details)), makeMinimalCtx(tempDir));
+		assert.equal(result.isError, undefined, JSON.stringify(result.content));
+		const running = updates.flatMap((update) => update.workflowChildren?.children ?? []).find((row) => row.childId === "a" && row.state === "running" && row.sessionFile);
+		assert.ok(running, "no running row named the child's session file");
+		assert.match(running.sessionFile, /\.jsonl$/);
+		assert.equal(result.details.workflowChildren.children.find((row) => row.childId === "a")?.sessionFile, running.sessionFile);
+	});
+
 	it("still runs a background workflow child when the host's progress callback throws at its launch", async () => {
 		mockPi.onCall({ matchArgIncludes: "Child A", delay: 100, output: "A done" });
 		const result = await makeExecutor([makeAgent("worker")], {}, true).execute("wf-launch-update-throws", {
@@ -4245,7 +4259,6 @@ Answer only from the supplied synthetic text.
 		assert.equal(persisted.results?.[0]?.outputReference, savedReport);
 		assert.equal(persisted.results?.[0]?.output, "review report");
 		assert.match(persisted.summary ?? "", new RegExp(escapeRegExp(expectedMapping)));
-		assert.match(fs.readFileSync(workflowOutput, "utf-8"), new RegExp(escapeRegExp(expectedMapping)));
 		assert.equal(fs.readFileSync(savedReport, "utf-8"), "review report");
 
 		fs.rmSync(started.details.asyncDir, { recursive: true, force: true });
@@ -4704,7 +4717,7 @@ Answer only from the supplied synthetic text.
 		assert.equal(result.details.workflow?.failureKind, "validation");
 	});
 
-	it("replaces stale workflow output when a child claims its path but writes no report", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("removes stale workflow output when a child claims its path but writes no report", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		const sharedOutput = path.join(tempDir, "failed-review.md");
 		fs.writeFileSync(sharedOutput, "stale workflow output", "utf-8");
 		mockPi.onCall({ exitCode: 1, stderr: "review child failed before writing output" });
@@ -4733,9 +4746,33 @@ Answer only from the supplied synthetic text.
 
 		assert.equal(result.isError, true);
 		assert.match(result.content[0]?.text ?? "", /review child failed before writing output/);
-		const workflowOutput = fs.readFileSync(sharedOutput, "utf-8");
-		assert.match(workflowOutput, /Workflow failed:.*review child failed before writing output/s);
-		assert.doesNotMatch(workflowOutput, /stale workflow output/);
+		assert.equal(fs.existsSync(sharedOutput), false);
+	});
+
+	it("keeps a report another writer puts at the output path while a workflow runs and then fails", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const sharedOutput = path.join(tempDir, "shared-report.md");
+		mockPi.onCall({ exitCode: 1, stderr: "child failed", writeFiles: [{ path: sharedOutput, content: "newer run's report" }] });
+		const result = await makeExecutor([makeAgent("echo")]).execute(
+			"scripted-workflow-shared-output-race",
+			{ async: false, output: sharedOutput, workflowScript: `const child = await runs.run("work", { agent: "echo", task: "Work" }); if (!child.ok) throw new Error(child.error); return child;` },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		assert.equal(result.isError, true);
+		assert.equal(fs.readFileSync(sharedOutput, "utf-8"), "newer run's report");
+	});
+
+	it("leaves a failed async workflow's declared output file unwritten", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const asyncOutput = path.join(tempDir, "async-review.md");
+		const started = await makeExecutor([makeAgent("echo")]).execute("scripted-workflow-failed-async-output", { async: true, output: asyncOutput, workflowScript: `throw new Error("review step failed");` }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		const resultPath = await waitForAsyncResultFile(started.details.asyncId!, 6_000);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as { success?: boolean; summary?: string };
+		assert.equal(payload.success, false);
+		assert.match(payload.summary ?? "", /review step failed/);
+		assert.equal(fs.existsSync(asyncOutput), false);
+		fs.rmSync(started.details.asyncDir!, { recursive: true, force: true });
+		fs.rmSync(resultPath, { force: true });
 	});
 
 	it("rejects sequential workflow child output collisions before launch", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

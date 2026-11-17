@@ -2,6 +2,7 @@ import * as path from "node:path";
 
 export const HERDR_PI_PROTOCOL = 1;
 export const HERDR_PI_MAX_FRAME_BYTES = 1024 * 1024;
+export const HERDR_PI_MAX_ACCEPTANCE_PROMPT_BYTES = 256 * 1024;
 export const HERDR_PI_MODE_ENV = "PI_SUBAGENTS_HERDR_BRIDGE";
 export const HERDR_PI_RUN_ENV = "PI_SUBAGENTS_HERDR_RUN_ID";
 export const HERDR_PI_RUNTIME_DIR_ENV = "PI_SUBAGENTS_HERDR_RUNTIME_DIR";
@@ -38,10 +39,10 @@ export class HerdrPiFrameDecoder {
 	#buffer = Buffer.alloc(0);
 	push(chunk: Buffer): HerdrPiFrame[] {
 		this.#buffer = Buffer.concat([this.#buffer, chunk]);
-		if (this.#buffer.byteLength > HERDR_PI_MAX_FRAME_BYTES) throw new Error(`Herdr Pi frame exceeds ${HERDR_PI_MAX_FRAME_BYTES} bytes.`);
 		const frames: HerdrPiFrame[] = [];
 		for (;;) {
 			const newline = this.#buffer.indexOf(10);
+			if ((newline < 0 ? this.#buffer.byteLength : newline) >= HERDR_PI_MAX_FRAME_BYTES) throw new Error(`Herdr Pi frame exceeds ${HERDR_PI_MAX_FRAME_BYTES} bytes.`);
 			if (newline < 0) break;
 			const line = this.#buffer.subarray(0, newline);
 			this.#buffer = this.#buffer.subarray(newline + 1);

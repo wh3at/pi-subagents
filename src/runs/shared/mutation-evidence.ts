@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { promisify } from "node:util";
-import type { ArtifactPaths, TimeoutRecoveryProjection, TimeoutRecoverySummary, TrackedMutationEvidence, TrackedMutationFingerprint, TrackedMutationSnapshot } from "../../shared/types.ts";
+import type { ArtifactPaths, HerdrRemoteGitStatus, TimeoutRecoveryProjection, TimeoutRecoverySummary, TrackedMutationEvidence, TrackedMutationFingerprint, TrackedMutationSnapshot } from "../../shared/types.ts";
 
 const MAX_TRACKED_PATHS = 500;
 const MAX_HASH_BYTES = 1024 * 1024;
@@ -47,6 +47,14 @@ async function hashFileAsync(diffPath: string): Promise<string> {
 
 function splitNul(output: string): string[] {
 	return output.split("\0").filter((part) => part.length > 0);
+}
+
+/** Git prints its whole option reference after the error, which must not reach recovery summaries. */
+function gitFailureReason(error: unknown): string {
+	const stderr = error && typeof error === "object" && "stderr" in error ? String(error.stderr ?? "") : "";
+	if (/not a git repository/i.test(stderr)) return "not a Git work tree";
+	const firstLine = (stderr || (error instanceof Error ? error.message : String(error))).split("\n").find((line) => line.trim().length > 0);
+	return firstLine?.trim() ?? "git failed";
 }
 
 function hashLargeDiff(cwd: string, relativePath: string): string {
@@ -100,7 +108,7 @@ export function snapshotTrackedMutations(cwd: string): TrackedMutationSnapshot {
 		for (const file of changed.paths) fingerprints[file] = fingerprintPath(cwd, file);
 		return { source: "tracked-files", trackedOnly: true, cwd, dirtyFiles: changed.paths, fingerprints, truncated: changed.truncated };
 	} catch (error) {
-		return { source: "tracked-files", trackedOnly: true, cwd, dirtyFiles: [], fingerprints: {}, unavailable: error instanceof Error ? error.message : String(error) };
+		return { source: "tracked-files", trackedOnly: true, cwd, dirtyFiles: [], fingerprints: {}, unavailable: gitFailureReason(error) };
 	}
 }
 
@@ -118,6 +126,16 @@ async function fingerprintPathAsync(cwd: string, relativePath: string): Promise<
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
 	}
+}
+
+/** A placed child on another machine edits that machine's disk, so local Git evidence stands in only as a marked placeholder. */
+export function remoteMutationSnapshot(cwd: string): TrackedMutationSnapshot {
+	return { source: "tracked-files", trackedOnly: true, cwd, dirtyFiles: [], fingerprints: {}, unavailable: "Local Git evidence is not authoritative for a pane-native remote run." };
+}
+
+export function remoteMutationEvidence(machine: { initialGit?: HerdrRemoteGitStatus; finalGit?: HerdrRemoteGitStatus }): TrackedMutationEvidence {
+	const changed = machine.initialGit && machine.finalGit ? machine.initialGit.head !== machine.finalGit.head || machine.initialGit.dirty !== machine.finalGit.dirty : undefined;
+	return { source: "tracked-files", trackedOnly: true, changedFiles: [], attemptedMutation: changed === true, ...(changed === undefined ? { unavailable: "Remote Git before/after evidence was incomplete." } : {}) };
 }
 
 export async function collectTrackedMutationEvidence(snapshot: TrackedMutationSnapshot, cwd = snapshot.cwd): Promise<TrackedMutationEvidence> {
@@ -145,7 +163,7 @@ export async function collectTrackedMutationEvidence(snapshot: TrackedMutationSn
 			truncated: snapshot.truncated || current.truncated || undefined,
 		};
 	} catch (error) {
-		return { source: "tracked-files", trackedOnly: true, changedFiles: [], attemptedMutation: false, unavailable: error instanceof Error ? error.message : String(error) };
+		return { source: "tracked-files", trackedOnly: true, changedFiles: [], attemptedMutation: false, unavailable: gitFailureReason(error) };
 	}
 }
 

@@ -198,6 +198,11 @@ export interface WorkflowChildSummary {
 		agent?: string;
 		/** Human-readable display name for the child session, when derived at launch. */
 		sessionName?: string;
+		/**
+		 * The child's session file, once its launch resolved one. The file may not exist until the
+		 * child writes its first entry; a host can follow it to show the child's transcript live.
+		 */
+		sessionFile?: string;
 		model?: string;
 		thinking?: string;
 		/** Present only while a synchronous foreground child is running. */
@@ -465,6 +470,8 @@ export interface ParallelHandoffCleanupTask {
 	naming?: WorktreeNaming;
 	worktreeRemoved: boolean;
 	branchRemoved: boolean;
+	/** Tip of a branch cleanup kept because no other branch, remote branch, or tag holds its commits. */
+	keptBranchTip?: string;
 	preserved?: boolean;
 	reason?: string;
 	errors?: string[];
@@ -531,6 +538,7 @@ export interface ParallelHandoffReference {
 	childCount: number;
 	changedPatches: number;
 	cleanupState: "complete" | "partial";
+	keptBranches?: Array<{ branch: string; tip: string }>;
 	cleanupEligibility?: CleanupEligibility;
 }
 
@@ -978,6 +986,11 @@ export interface AgentProgress {
 	agent: string;
 	/** Human-readable display name for the child's session, when derived at launch. */
 	sessionName?: string;
+	/**
+	 * The child's session file, from launch, when it has one. The file may not exist until the
+	 * child writes its first entry; a host can follow it to show the child's transcript live.
+	 */
+	sessionFile?: string;
 	status: "pending" | "running" | "completed" | "failed" | "detached";
 	progressText?: string;
 	progressUpdatedAt?: number;
@@ -1815,8 +1828,17 @@ export interface RexSshMachineReference {
 
 export type RexMachineReference = RexLocalMachineReference | RexSshMachineReference;
 
-/** Where a placed native Pi child runs. */
-export type PlacementMachineReference = HerdrMachineReference | RexMachineReference;
+/** `machine: "local"` inside a Herdr pane: a tab in the parent's own Herdr session on this machine, reached over its local socket. `socket` and `session` are recorded in the parent at resolution time; `cwd` is the real local launch directory. */
+export interface HerdrLocalMachineReference {
+	provider: "herdr";
+	id: "local";
+	socket: string;
+	session?: string;
+	cwd: string;
+}
+
+/** Where a placed native Pi child runs. A reference without `target` is on this machine. */
+export type PlacementMachineReference = HerdrMachineReference | HerdrLocalMachineReference | RexMachineReference;
 
 export interface ExternalCliMachineStatus extends HerdrMachineReference {
 	remoteGit?: HerdrRemoteGitStatus;
