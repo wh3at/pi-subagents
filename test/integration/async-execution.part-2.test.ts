@@ -966,16 +966,18 @@ syncBuiltinESMExports();
 	});
 
 	it("keeps a parallel sibling's per-tool timeout armed when the run deadline is closer but a supervisor wait pauses it", { skip: !isAsyncAvailable() ? "jiti not available" : process.platform === "win32" ? "timeout signal delivery intermittent on Windows CI" : undefined }, async () => {
+		// The run deadline counts from launch, but child events arrive only after the runner and child boot (over 1.7 s on slow CI),
+		// so the ask starts at once and the deadline leaves room for that boot; the tool's own timeout still ends after the unpaused deadline.
 		mockPi.onCall({ matchArgIncludes: "Ask the supervisor", steps: [
-			{ delay: 300, jsonl: [{ ...events.toolStart("contact_supervisor", { reason: "need_decision", message: "Question" }), toolCallId: "ask-1" }] },
-			{ delay: 3_000, jsonl: [{ ...events.toolEnd("contact_supervisor"), toolCallId: "ask-1" }, events.assistantMessage("asker done"), { type: "agent_end", willRetry: false }, { type: "agent_settled" }] },
+			{ jsonl: [{ ...events.toolStart("contact_supervisor", { reason: "need_decision", message: "Question" }), toolCallId: "ask-1" }] },
+			{ delay: 4_000, jsonl: [{ ...events.toolEnd("contact_supervisor"), toolCallId: "ask-1" }, events.assistantMessage("asker done"), { type: "agent_end", willRetry: false }, { type: "agent_settled" }] },
 		] });
 		mockPi.onCall({ matchArgIncludes: "Run a wedged tool", steps: [
 			{ delay: 400, jsonl: [{ ...events.toolStart("bash"), toolCallId: "bash-1" }] },
 			{ delay: 6_000 },
 		] });
 		const id = `async-supervisor-wait-tool-timeout-${Date.now().toString(36)}`;
-		process.env.PI_SUBAGENT_TOOL_TIMEOUT_MS = "1500";
+		process.env.PI_SUBAGENT_TOOL_TIMEOUT_MS = "2700";
 		try {
 			executeAsyncChain(id, {
 				chain: [{ parallel: [{ agent: "one", task: "Ask the supervisor" }, { agent: "two", task: "Run a wedged tool" }] }],
@@ -984,10 +986,10 @@ syncBuiltinESMExports();
 				artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
 				shareEnabled: false,
 				maxSubagentDepth: 2,
-				timeoutMs: 2_000,
+				timeoutMs: 3_000,
 			});
 			const payload = await readAsyncPayload(id);
-			assert.equal(payload.results[1]?.error, "Tool 'bash' exceeded its timeout of 1500ms.", JSON.stringify(payload.results.map((result) => result.error)));
+			assert.equal(payload.results[1]?.error, "Tool 'bash' exceeded its timeout of 2700ms.", JSON.stringify(payload.results.map((result) => result.error)));
 		} finally {
 			delete process.env.PI_SUBAGENT_TOOL_TIMEOUT_MS;
 		}
@@ -1311,6 +1313,31 @@ syncBuiltinESMExports();
 		assert.match(payload.results[0]?.error ?? "", /requested unavailable child tools: fixture_search/);
 		assert.equal(payload.results[0]?.effects?.fileMutation, undefined);
 		assert.equal(statusPayload.steps?.[0]?.effects?.fileMutation, undefined);
+	});
+
+	it("reports the replaced-tools diagnostic, not the abort it caused, when an extension leaves allowlisted tools out of the request", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			undeclaredTools: ["read", "grep"],
+			jsonl: [{ type: "message_end", message: { role: "assistant", content: [], model: "openai/gpt-5-mini", stopReason: "aborted", errorMessage: "Request was aborted", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } }],
+		});
+		const id = `async-undeclared-tools-${Date.now().toString(36)}`;
+
+		executeAsyncSingle(id, {
+			agent: "probe",
+			task: "Report your tool names",
+			agentConfig: makeAgent("probe", { tools: ["read", "grep"] }),
+			ctx: { pi: { events: { emit() {} }, getAllTools: () => [{ name: "read", sourceInfo: { source: "builtin" } }, { name: "grep", sourceInfo: { source: "builtin" } }] }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false,
+			sessionRoot: path.join(tempDir, "sessions"),
+			maxSubagentDepth: 2,
+			acceptance: false,
+		});
+
+		const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id, 10_000), "utf-8")) as AsyncResultPayload;
+		assert.equal(payload.success, false);
+		assert.match(payload.results[0]?.error ?? "", /^Agent 'probe' declares tools: read, grep, but an extension loaded in this child replaced the tools sent to the model: it left out read, grep and added fabric_exec/);
+		assert.doesNotMatch(payload.results[0]?.error ?? "", /aborted/i);
 	});
 
 	it("applies agent acceptance roles to inferred async acceptance", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {

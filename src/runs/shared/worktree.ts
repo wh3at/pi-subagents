@@ -7,7 +7,7 @@ import * as path from "node:path";
 import { resolveAuthorityDecision, type AuthorityPolicyConfig } from "../../policy/authority.ts";
 import { PROJECT_SUBAGENTS_RELATIVE_DIR } from "../../shared/artifacts.ts";
 import { getAgentDir } from "../../shared/utils.ts";
-import type { ManagedWorktreeProvider, WorktreeNaming, WorktreeProvider } from "../../shared/types.ts";
+import type { ManagedWorktreeProvider, ParallelHandoffCleanupTask, WorktreeNaming, WorktreeProvider } from "../../shared/types.ts";
 
 export const DEFAULT_WORKTREE_PROVIDER: WorktreeProvider = "auto";
 export const DEFAULT_WORKTREE_BASE_REF = "HEAD";
@@ -81,19 +81,7 @@ export interface WorktreeDiff {
 	error?: string;
 }
 
-export interface WorktreeCleanupTask {
-	recordedBaseDir?: string;
-	index: number;
-	path: string;
-	branch: string;
-	provider?: ManagedWorktreeProvider;
-	naming?: WorktreeNaming;
-	worktreeRemoved: boolean;
-	branchRemoved: boolean;
-	preserved?: boolean;
-	reason?: string;
-	errors?: string[];
-}
+export type WorktreeCleanupTask = ParallelHandoffCleanupTask;
 
 export type WorktreeCleanupIntent =
 	| { kind: "preserve"; capturedDiffs?: WorktreeDiff[]; handoffManifestPath?: string; cleanupBlocker?: string }
@@ -372,8 +360,11 @@ async function probeWorktreeSource(tx: Pick<SetupTransaction, "git" | "gitChecke
 	// pi-subagents writes durable runtime state under .pi/subagents/ by default;
 	// that state must not make managed isolation unusable for later runs.
 	const status = await tx.gitChecked(toplevel, ["status", "--porcelain", "--", `:!${PROJECT_SUBAGENTS_RELATIVE_DIR}`]);
-	if (status.trim().length > 0) {
-		throw new Error("worktree isolation requires a clean git working tree. Commit or stash changes first.");
+	const changes = status.split("\n").filter((line) => line.trim().length > 0);
+	if (changes.length > 0) {
+		const shown = changes.slice(0, 10).map((line) => `  ${line}`);
+		if (changes.length > shown.length) shown.push(`  … and ${changes.length - shown.length} more`);
+		throw new Error(`worktree isolation requires a clean git working tree: ${toplevel} has ${changes.length} uncommitted change(s):\n${shown.join("\n")}\nCommit or stash them first.`);
 	}
 	return toplevel;
 }
@@ -1208,6 +1199,7 @@ function cleanupSingleWorktree(
 	const errors: string[] = [];
 	let worktreeRemoved = false;
 	let branchRemoved = false;
+	let keptBranchTip: string | undefined;
 	if (intent.kind === "preserve" && intent.cleanupBlocker) {
 		return {
 			index: worktree.index,
@@ -1315,11 +1307,30 @@ function cleanupSingleWorktree(
 		errors.push(`worktree removal failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
 	if (worktreeRemoved) {
-		try {
-			runGitChecked(setup.cwd, ["branch", "-D", worktree.branch]);
-			branchRemoved = true;
-		} catch (error) {
-			errors.push(`branch removal failed: ${error instanceof Error ? error.message : String(error)}`);
+		let deleteBranch = true;
+		if (intent.kind === "preserve") {
+			// The handoff patch keeps the child's content but not its commits, so a branch holding the only copy of them stays.
+			try {
+				const tip = runGitChecked(setup.cwd, ["rev-parse", "--verify", `refs/heads/${worktree.branch}^{commit}`]).trim();
+				if (tip !== setup.baseCommit) {
+					const containing = runGitChecked(setup.cwd, ["for-each-ref", "--contains", tip, "--format=%(refname)", "refs/heads", "refs/remotes", "refs/tags"]);
+					if (!containing.split("\n").some((ref) => ref && ref !== `refs/heads/${worktree.branch}`)) {
+						keptBranchTip = tip;
+						deleteBranch = false;
+					}
+				}
+			} catch (error) {
+				deleteBranch = false;
+				errors.push(`branch check failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}
+		if (deleteBranch) {
+			try {
+				runGitChecked(setup.cwd, ["branch", "-D", worktree.branch]);
+				branchRemoved = true;
+			} catch (error) {
+				errors.push(`branch removal failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
 		}
 	}
 	return {
@@ -1331,6 +1342,7 @@ function cleanupSingleWorktree(
 		...(worktree.recordedBaseDir ? { recordedBaseDir: worktree.recordedBaseDir } : {}),
 		worktreeRemoved,
 		branchRemoved,
+		...(keptBranchTip ? { keptBranchTip } : {}),
 		...(errors.length ? { errors } : {}),
 	};
 }
@@ -1526,6 +1538,11 @@ export function diffWorktrees(setup: WorktreeSetup, agents: string[], diffsDir: 
 	return diffs;
 }
 
+/** A branch kept for its commits is a finished cleanup, the same as a removed one. */
+export function isWorktreeCleanupTaskDone(task: Pick<WorktreeCleanupTask, "worktreeRemoved" | "branchRemoved" | "keptBranchTip">): boolean {
+	return task.worktreeRemoved && (task.branchRemoved || task.keptBranchTip !== undefined);
+}
+
 export function cleanupWorktrees(
 	setup: WorktreeSetup,
 	intent: WorktreeCleanupIntent = { kind: "preserve", ...(setup.capturedDiffs ? { capturedDiffs: setup.capturedDiffs } : {}) },
@@ -1544,7 +1561,7 @@ export function cleanupWorktrees(
 	} catch (error) {
 		errors.push(`worktree prune failed: ${error instanceof Error ? error.message : String(error)}`);
 	}
-	const state = tasks.every((task) => task.worktreeRemoved && task.branchRemoved) && pruned ? "complete" : "partial";
+	const state = tasks.every(isWorktreeCleanupTaskDone) && pruned ? "complete" : "partial";
 	return {
 		state,
 		tasks,

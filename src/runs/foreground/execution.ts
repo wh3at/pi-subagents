@@ -69,7 +69,7 @@ import { formatMidToolExitError, isOrdinaryToolForMidToolExit } from "../shared/
 import { formatChildToolDiagnostic } from "../shared/tool-availability.ts";
 import { formatChildModelResolutionDiagnostic, formatInheritedProviderDiagnostic, isChildModelResolutionFailure } from "../shared/model-resolution-diagnostic.ts";
 import { planAbortRecovery } from "../shared/abort-recovery.ts";
-import { buildTimeoutRecoverySummary, collectTrackedMutationEvidence, snapshotTrackedMutations } from "../shared/mutation-evidence.ts";
+import { buildTimeoutRecoverySummary, collectTrackedMutationEvidence, remoteMutationEvidence, remoteMutationSnapshot, snapshotTrackedMutations } from "../shared/mutation-evidence.ts";
 import { captureSingleOutputSnapshot, extractChildWrittenOutput, finalizeSingleOutput, formatSavedOutputReference, hasSingleOutputChangedSinceSnapshot, isSettlementFatalOutputError, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
 import {
 	formatSubagentModelVerificationError,
@@ -108,7 +108,7 @@ import { buildInProcessChildLaunch, createReportedChildSessionInput } from "../s
 import { childSessionFactory, childSessionHasQueuedMessages, projectChildSessionEventForJson, type ChildSession, type ChildSessionEvent } from "../shared/child-session.ts";
 import { reconcileAttemptUsage } from "../shared/usage-reconciliation.ts";
 import { clearProviderRetry, observeProviderDiagnostics, snapshotProviderDiagnostics } from "../../shared/provider-diagnostics.ts";
-import { isRexLocalMachine } from "../shared/rex-machine.ts";
+import { editsLocalDisk } from "../shared/rex-machine.ts";
 import { pauseForSupervisorWait, startPausableTimer, type PausableTimer } from "../shared/supervisor-wait-timer.ts";
 
 const artifactOutputByResult = new WeakMap<SingleResult, string>();
@@ -402,6 +402,7 @@ async function runSingleAttempt(
 		machine: options.machine,
 		remoteSkillNames: options.skills ?? agent.skills,
 		remoteReads: options.remoteReads,
+		acceptancePrompt: shared.acceptancePrompt,
 		extensionBindings: options.extensionBindings,
 		requiredExtensions: options.requiredExtensions,
 		sessionEnabled: shared.sessionEnabled,
@@ -521,6 +522,7 @@ async function runSingleAttempt(
 		index: options.index ?? 0,
 		agent: agent.name,
 		...(childSessionName ? { sessionName: childSessionName } : {}),
+		...(options.sessionFile ? { sessionFile: options.sessionFile } : {}),
 		status: "running",
 		task,
 		skills: shared.resolvedSkillNames,
@@ -561,8 +563,8 @@ async function runSingleAttempt(
 		return result;
 	}
 	// A machine 'local' child edits this disk, so its local Git evidence is authoritative, as for an unplaced run.
-	const mutationCwd = isRexLocalMachine(options.machine) ? options.machine.cwd : options.cwd ?? runtimeCwd;
-	const mutationSnapshot = options.machine && !isRexLocalMachine(options.machine) ? { source: "tracked-files" as const, trackedOnly: true as const, cwd: mutationCwd, dirtyFiles: [], fingerprints: {}, unavailable: "Local Git evidence is not authoritative for a pane-native remote run." } : snapshotTrackedMutations(mutationCwd);
+	const mutationCwd = editsLocalDisk(options.machine) ? options.machine.cwd : options.cwd ?? runtimeCwd;
+	const mutationSnapshot = options.machine && !editsLocalDisk(options.machine) ? remoteMutationSnapshot(mutationCwd) : snapshotTrackedMutations(mutationCwd);
 	let structuredOutputToolInvoked = false;
 	let structuredOutputMessageStartIndex: number | undefined;
 	let toolAvailabilityError: string | undefined;
@@ -1626,8 +1628,7 @@ async function runSingleAttempt(
 		tokens: progress.tokens,
 		durationMs: progress.durationMs,
 	};
-	const remoteGitChanged = result.nativeMachine?.initialGit && result.nativeMachine.finalGit ? result.nativeMachine.initialGit.head !== result.nativeMachine.finalGit.head || result.nativeMachine.initialGit.dirty !== result.nativeMachine.finalGit.dirty : undefined;
-	const mutationEvidence = result.nativeMachine && !isRexLocalMachine(options.machine) ? { source: "tracked-files" as const, trackedOnly: true as const, changedFiles: [], attemptedMutation: remoteGitChanged === true, ...(remoteGitChanged === undefined ? { unavailable: "Remote Git before/after evidence was incomplete." } : {}) } : await collectTrackedMutationEvidence(mutationSnapshot, mutationCwd);
+	const mutationEvidence = result.nativeMachine && !editsLocalDisk(options.machine) ? remoteMutationEvidence(result.nativeMachine) : await collectTrackedMutationEvidence(mutationSnapshot, mutationCwd);
 
 	const acceptanceOutput = getFinalOutput(result.messages ?? []);
 	const structuredText = result.structuredOutput === undefined ? undefined : JSON.stringify(result.structuredOutput, null, 2);
@@ -1733,7 +1734,7 @@ async function runSyncCompletionInner(
 ): Promise<SingleResult> {
 	const effectiveCwd = options.cwd ?? runtimeCwd;
 	// A placed child's cwd is a directory on its machine; only machine 'local' shares this disk.
-	const cwdError = options.machine && !isRexLocalMachine(options.machine) ? undefined : preflightLaunchCwd(options.requestedCwd ?? effectiveCwd, effectiveCwd);
+	const cwdError = options.machine && !editsLocalDisk(options.machine) ? undefined : preflightLaunchCwd(options.requestedCwd ?? effectiveCwd, effectiveCwd);
 	if (cwdError) {
 		return redactResultPrompt(withRunContext({
 			index: options.index ?? 0,
