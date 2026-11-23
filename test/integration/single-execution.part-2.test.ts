@@ -52,7 +52,7 @@ import { CHILD_WATCHDOG_STATUS_EVENT } from "../../src/watchdog/child-status.ts"
 import { createRunFanoutBudget } from "../../src/runs/shared/run-fanout-budget.ts";
 import { MainWatchdogRuntime } from "../../src/watchdog/runtime.ts";
 import { SUBAGENT_CHILD_ENV, type ChildRuntimeConfig } from "../../src/runs/shared/child-runtime-config.ts";
-import { createNestedRoute, parseNestedEventRecords } from "../../src/runs/shared/nested-events.ts";
+import { createNestedRoute, findNestedRouteForRootId, parseNestedEventRecords, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
 import { resolveMissionStoreLocation } from "../../src/missions/store.ts";
 import { missionStatePath } from "../../src/missions/workflow-state.ts";
 import { discardPreservedWorktrees } from "../../src/runs/shared/parallel-handoff.ts";
@@ -64,6 +64,7 @@ import { toSubagentDelegationExecutionParams, toSubagentDelegationUpdate } from 
 import { registerRequiredChildExtensions } from "../../src/api/required-child-extensions.ts";
 import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-output.ts";
 import { ensureSupervisorChannelDir, resolveSupervisorChannelDir } from "../../src/intercom/native-supervisor-channel.ts";
+import { flattenSubagentToolOptions } from "../../src/extension/subagent-options.ts";
 
 /** Every saved foreground run: one file each under results/foreground-history. */
 function savedForegroundRuns<T>(): T[] {
@@ -1249,6 +1250,35 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.equal(mockPi.callCount(), 2, "both detached mock children should start before test cleanup");
 	});
 
+	it("lists nested children of an async run without reconciling", { timeout: 30_000 }, async () => {
+		mockPi.onCall({ output: "async root done" });
+		const executor = makeExecutor([makeAgent("echo")]);
+		const started = await executor.execute("nested-async-root", { agent: "echo", task: "Root", async: true }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(started.isError, undefined, started.content[0]?.text ?? "async launch failed");
+		const asyncId = started.details.asyncId!;
+		const statusPath = path.join(DIRS.async, asyncId, "status.json");
+		const deadlineAt = Date.now() + 15_000;
+		while ((JSON.parse(fs.readFileSync(statusPath, "utf-8")) as { state?: string }).state !== "complete" && Date.now() < deadlineAt) {
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		const route = findNestedRouteForRootId(asyncId);
+		assert.ok(route, "the nested route should be keyed by the async run id");
+		try {
+			writeNestedEvent(route, {
+				type: "subagent.nested.completed",
+				ts: Date.now(),
+				parentRunId: asyncId,
+				parentStepIndex: 0,
+				child: { id: "nested-leaf", parentRunId: asyncId, parentStepIndex: 0, depth: 1, path: [{ runId: asyncId, stepIndex: 0 }], mode: "single", state: "complete", agent: "leaf", agents: ["leaf"], startedAt: 1, lastUpdate: 2, steps: [{ agent: "leaf", status: "complete" }] },
+			});
+			const [run] = listAsyncRuns(DIRS.async, { runId: asyncId, exactRunId: true, includeNested: true, reconcile: false });
+			assert.deepEqual(run?.nestedChildren?.map((child) => child.id), ["nested-leaf"]);
+			assert.deepEqual(run?.steps[0]?.children?.map((child) => child.id), ["nested-leaf"]);
+		} finally {
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
+		}
+	});
+
 	it("does not impose a cumulative spawn cap by default", async () => {
 		mockPi.onCall({ output: "continued after forty launches" });
 		const spawnState = { sessionId: "session-123", count: 40 };
@@ -2082,6 +2112,78 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		} finally {
 			watcher.stopResultWatcher();
 		}
+	});
+
+	it("names a labeled workflow child's own session and async step by its label", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([makeAgent("echo")], {}, true, undefined, true, new Map(), undefined, undefined, createEventBus());
+		const ctx = makeMinimalCtx(tempDir);
+		// The executor runs workflow children async by default, so omitting `async` gives an awaited async child.
+		for (const [index, childAsync] of [false, true].entries()) {
+			mockPi.onCall({ output: "done" });
+			const result = await executor.execute(
+				`labeled-child-${childAsync}`,
+				{ async: false, workflowScript: `return runs.run("child", { agent: "echo", label: " Validate sanitizer tests ", task: "Run the sanitizer suite and report every failing case",${childAsync ? "" : " async: false,"} acceptance: false, output: false });` },
+				new AbortController().signal, undefined, ctx,
+			);
+			assert.equal(result.isError, undefined, result.content[0]?.text ?? "workflow failed");
+			assert.equal(mockPi.callCount(), index + 1);
+			assert.equal(readCall().runtime?.sessionName, "echo: Validate sanitizer tests");
+			if (!childAsync) continue;
+			const child = result.details.workflow?.value as { runId?: string };
+			const status = JSON.parse(fs.readFileSync(path.join(DIRS.async, child.runId!, "status.json"), "utf-8")) as AsyncStatus;
+			assert.deepEqual(status.steps?.map(({ label, sessionName }) => ({ label, sessionName })), [{ label: "Validate sanitizer tests", sessionName: "echo: Validate sanitizer tests" }]);
+		}
+	});
+
+	it("names a direct launch by its top-level label and ignores a non-string one", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([makeAgent("echo")]);
+		const ctx = makeMinimalCtx(tempDir);
+		for (const [label, sessionName] of [[" Validate sanitizer tests ", "echo: Validate sanitizer tests"], [5, "echo: Run the sanitizer suite"]] as const) {
+			mockPi.onCall({ output: "done" });
+			const params = flattenSubagentToolOptions({ agent: "echo", task: "Run the sanitizer suite", label, async: false });
+			const result = await executor.executePublic(`top-level-label-${label}`, params, new AbortController().signal, undefined, ctx);
+			assert.equal(result.isError, undefined, result.content[0]?.text ?? "launch failed");
+			assert.equal(readCall().runtime?.sessionName, sessionName);
+		}
+	});
+
+	it("names a labeled direct async launch in its async-started event, status step and session", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const bus = createEventBus();
+		const started: Array<Record<string, unknown>> = [];
+		bus.on(SUBAGENT_ASYNC_STARTED_EVENT, (event) => started.push(event as Record<string, unknown>));
+		const executor = makeExecutor([makeAgent("echo")], {}, false, undefined, true, new Map(), undefined, undefined, bus);
+		mockPi.onCall({ output: "done" });
+		const params = flattenSubagentToolOptions({ agent: "echo", task: "Run the sanitizer suite", label: "Validate sanitizer tests", async: true });
+		const result = await executor.executePublic("labeled-async-launch", params, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(result.isError, undefined, result.content[0]?.text ?? "launch failed");
+		assert.equal(started.find((event) => event.id === result.details.asyncId)?.description, "Validate sanitizer tests");
+		const status = JSON.parse(fs.readFileSync(path.join(result.details.asyncDir!, "status.json"), "utf-8")) as AsyncStatus;
+		assert.equal(status.steps?.[0]?.label, "Validate sanitizer tests");
+		for (const deadline = Date.now() + 30_000; mockPi.callCount() < 1 && Date.now() < deadline;) await new Promise((resolve) => setTimeout(resolve, 50));
+		assert.equal(readCall().runtime?.sessionName, "echo: Validate sanitizer tests");
+	});
+
+	it("names a labeled parallel task in its async-started event and session", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const bus = createEventBus();
+		const started: Array<Record<string, unknown>> = [];
+		bus.on(SUBAGENT_ASYNC_STARTED_EVENT, (event) => started.push(event as Record<string, unknown>));
+		const executor = makeExecutor([makeAgent("echo")], {}, true, undefined, true, new Map(), undefined, undefined, bus);
+		mockPi.onCall({ output: "done" });
+		mockPi.onCall({ output: "done" });
+		const result = await executor.executePublic(
+			"labeled-parallel-task",
+			{ workflow: "parallel", args: { tasks: [{ agent: "echo", task: "Run the sanitizer suite", label: "Validate sanitizer tests" }, { agent: "echo", task: "Map the tests" }] }, async: false },
+			new AbortController().signal, undefined, makeMinimalCtx(tempDir),
+		);
+		assert.equal(result.isError, undefined, result.content[0]?.text ?? "parallel workflow failed");
+		const children = started.filter((event) => event.mode === "single").map(({ workflowKey, description }) => ({ workflowKey, description }));
+		assert.deepEqual(children.sort((a, b) => String(a.workflowKey).localeCompare(String(b.workflowKey))), [
+			{ workflowKey: "task-1", description: "Validate sanitizer tests" },
+			{ workflowKey: "task-2", description: "Test agent: echo" },
+		]);
+		const sessionNames = fs.readdirSync(mockPi.dir).filter((name) => name.startsWith("call-") && name.endsWith(".json"))
+			.map((name) => (JSON.parse(fs.readFileSync(path.join(mockPi.dir, name), "utf-8")) as { runtime?: { sessionName?: string } }).runtime?.sessionName);
+		assert.deepEqual(sessionNames.sort(), ["echo: Map the tests", "echo: Validate sanitizer tests"]);
 	});
 
 	it("preserves original parent authority when reviving a foreground child", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

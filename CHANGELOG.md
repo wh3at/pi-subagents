@@ -6,6 +6,54 @@
 
 - Reviewers can inspect local committed ranges with `watchdog_diff({ baseRef: "main" })` without shell access or a parent-generated artifact. Refs are pinned, the merge base is explicit, and working-tree changes, external diff/textconv programs, and lazy object fetching are excluded.
 
+## [0.90.0] - 2026-11-22
+
+### Highlights
+
+- Give a subagent a short `label` and it shows up by that name in its session, its status row and the events host apps receive, so several runs of the same agent are easy to tell apart.
+- A `parallel` workflow can run its tasks one at a time with `globalConcurrencyLimit: 1`.
+- Finished workflows are now cleaned up from disk like other background runs, instead of piling up to tens of gigabytes.
+- On Windows, a locked status file at the end of a workflow no longer crashes Pi.
+- An install can turn off session sharing with `disabledFeatures: ["session-sharing"]`, so no run can upload a session to a GitHub Gist.
+
+### Added
+
+- A direct subagent launch can now be named with a short top-level `label`, for example `subagent({ agent: "worker", task: "…", label: "Fix login redirect" })`, and so can each `args.tasks` item of `workflow: "parallel"`. The label names the child's session and status row, as a workflow child's `runs.run` label already does, and `subagent:async-started` carries it as `description`, so hosts that list running children can tell several runs of the same agent apart. Thanks to [@mmarabel](https://github.com/mmarabel) for the report (#3324).
+- A foreground subagent run now emits `task:subagent:lifecycle` (`started`, then `completed`, `failed` or `aborted`) on Pi's extension event bus, so host apps that only watch `subagent:async-*` can show foreground runs. The payload carries the run id, agent name and a description (the launch's `label`, or else the agent's description), never the task prompt. `subagent:async-started` for single, chain and parallel runs now carries `description` by the same rule. Thanks to [@Andy123qq4](https://github.com/Andy123qq4) for #3318.
+- A named workflow call such as `{ workflow: "parallel", args: { tasks: [...] } }` now accepts a top-level `globalConcurrencyLimit`, so `globalConcurrencyLimit: 1` runs its tasks one at a time; before, the call was refused. When `args.concurrency` is passed to `parallel`, the error now points to `globalConcurrencyLimit`. Thanks to [@mmarabel](https://github.com/mmarabel) for #3320.
+- `disabledFeatures: ["session-sharing"]` now removes `share` from the `subagent` tool, so a run cannot upload a session to a GitHub Gist from that install. A resume whose saved launch enabled `share` is refused before it starts, and the run stays resumable once the setting is gone. Nothing changes when the setting is absent. Before, the only ways to stop the upload were to remove `gh` from `PATH`, revoke the `gist` OAuth scope, or block network access. Thanks to [@jpodivin](https://github.com/jpodivin) for #3323 and to [@marcfargas](https://github.com/marcfargas) for the report (#30).
+- A new `fastServiceTier` setting chooses the OpenAI service tier that `fast: true` requests for native OpenAI-Codex children: `"priority"` (the default, as before) or `"ultrafast"`. Before, fast mode could only request Priority. Thanks to [@FireSpoonYZ](https://github.com/FireSpoonYZ) for #3317.
+
+### Fixed
+
+- Finished workflows and their subagents are now deleted from disk like other background runs. Before, async retention kept every workflow run, workflow child and revived child forever, so `async-subagent-runs` could grow to tens of gigabytes. A workflow is now removed with its children once it has finished and passed the 30-day window; it is still kept while it, any of its children, or a revival of one is running, recent or still resumable. Thanks to [@youlikemodernart](https://github.com/youlikemodernart) for the report (#3326).
+- On Windows, an async workflow whose last writes to `status.json` failed with `EPERM` no longer crashes Pi. When another process held the file locked, the error escaped the workflow's teardown and took the whole process down. The failure is now recorded as a `subagent.workflow.status_write_failed` event, the workflow's result is still delivered, and `status.json` catches up with the finished state once the lock clears (Pi keeps retrying for up to a minute without blocking). Thanks to [@M0-3del](https://github.com/M0-3del) for the report (#3325).
+- A background subagent that launches its own nested subagents now shows them in the Fleet status widget, `subagent({ action: "status" })` and its completion result. Before, the nested children were filed under the wrong run id, so status never found them. Thanks to [@dvishoot](https://github.com/dvishoot) for #3316.
+- A `subagent` call with `workflow: true` and `options.script` now runs the script, as `options.script` alone does, instead of failing with `options.script replaces workflow`. A named workflow or a script path together with `options.script` is still refused. Thanks to [@mmarabel](https://github.com/mmarabel) for the report (#3320).
+- A foreground subagent's result in the tool details (`details.results[i]`) no longer carries hidden Symbol keys, so extensions that hash or compare tool results, such as pi-fold, see a plain JSON object. Thanks to [@xiaquwan1001](https://github.com/xiaquwan1001) for the report (#3319).
+- pi-subagents now type-checks against Pi 1.6, whose components return read-only render output, without changing its dependency pins. Thanks to [@Giesch](https://github.com/Giesch) for #3322.
+- The tool reference warns again that a secret Gist is unlisted, not private, and that nothing asks before the upload, and says how to turn sharing off. The warning was lost when the README was split into guides (#30).
+
+## [0.89.2] - 2026-11-20
+
+### Highlights
+
+- Subagents in a Herdr pane (`machine: "local"`) no longer fail to start, and Herdr project panes on Windows now work in Git Bash.
+- In `/subagents-fleet`, expanded tool details show a `bash` call's whole command, including multiline scripts.
+- A workflow child with a `label` is named by that label in its session name, terminal title and Fleet row.
+- The child watchdog no longer tells you to undo work the supervisor approved.
+- Subagents can use MCP servers configured with `"openUi": false`.
+
+### Fixed
+
+- A subagent placed in a Herdr pane (`machine: "local"`) no longer fails to start with `is not an active named agent`. Herdr holds a newly started agent as pending until something asks for its state, so retrying the first prompt alone never got through. pi-subagents now waits for the agent to be ready before it prompts again. Thanks to [@TheEdgeOfRage](https://github.com/TheEdgeOfRage) for #3312.
+- On Windows, a Herdr project pane now starts Pi when the pane runs Git Bash or another POSIX shell. The launch command was always written for PowerShell, so a Git Bash pane failed with `syntax error near unexpected token '&'` and never started. Thanks to [@mystery4f](https://github.com/mystery4f) for #3306.
+- In `/subagents-fleet`, expanding tool details (`x` or `Ctrl+O`) now shows a `bash` call's whole command, every line wrapped to the pane, while it runs and after it finishes. Before, a multiline script such as a heredoc was cut to one line. When the saved arguments were too large to keep in full, the expanded view shows what was saved and says it was truncated. Thanks to [@power22c](https://github.com/power22c) for the report (#3308).
+- A subagent started from a workflow script with a short `label` (for example `runs.run("tests", { label: "Validate sanitizer tests", agent: "worker", task: "…" })`) is now named by that label: its session name and Pi terminal title read `worker: Validate sanitizer tests`, and its Fleet row reads `Validate sanitizer tests (worker)`. Before, only the workflow's own row used the label, and the subagent was named after the first words of its task, so several children of the same agent were hard to tell apart. Thanks to [@power22c](https://github.com/power22c) for the report (#3309).
+- The child watchdog no longer warns that a change the supervisor approved was unauthorised. When a subagent asks its supervisor a question and follows the answer, the watchdog now always sees that question and answer, even in a long run whose earlier turns no longer fit in its review. Before, the answer could drop out, and the watchdog reported the instruction as missing and suggested undoing correct work. The watchdog is also told when earlier turns were left out, so it doesn't treat missing evidence as proof. Thanks to [@mannainsect](https://github.com/mannainsect) for the report (#3307).
+- A subagent that lists `mcp:<server>` in its `tools` now starts when that server's MCP config sets `"openUi": false`. Before, it failed with `Unresolved MCP direct-tool selectors` even though the server was connected, because pi-mcp-adapter 7 counts that setting when it checks its cached tool list and pi-subagents did not (#3310). Thanks to [@carlesba](https://github.com/carlesba) for #3311.
+- A workflow no longer waits forever when one of its background subagents finishes after the Pi that started it has exited, for example because Pi was restarted. Once the subagent's process is confirmed gone, the workflow treats it as finished. Thanks to [@tdslot](https://github.com/tdslot) for the report (#3304).
+
 ## [0.89.1] - 2026-11-18
 
 ### Highlights
